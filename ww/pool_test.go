@@ -472,6 +472,54 @@ func TestPool_Release(t *testing.T) {
 	}
 }
 
+func TestPool_Release_RemovesGitignoredFiles(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	workspacesDir := t.TempDir()
+	workspacesDir, _ = filepath.EvalSymlinks(workspacesDir)
+	stateDir := t.TempDir()
+
+	pool := openPool(t, ww.Options{
+		StateDir:      stateDir,
+		WorkspacesDir: workspacesDir,
+	})
+
+	wsPath, err := pool.Acquire(repoPath, acquireOptions())
+	if err != nil {
+		t.Fatalf("failed to acquire workspace: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(wsPath, ".gitignore"), []byte("build/\n*.log\n"), 0644); err != nil {
+		t.Fatalf("write gitignore: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wsPath, "README.md"), []byte("# hi"), 0644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(wsPath, "build", "nested"), 0755); err != nil {
+		t.Fatalf("mkdir build/nested: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wsPath, "build", "nested", "out.txt"), []byte("out"), 0644); err != nil {
+		t.Fatalf("write build/nested/out.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wsPath, "test.log"), []byte("log"), 0644); err != nil {
+		t.Fatalf("write test.log: %v", err)
+	}
+
+	if err := pool.Release(wsPath); err != nil {
+		t.Fatalf("failed to release workspace: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(wsPath, "build")); !os.IsNotExist(err) {
+		t.Errorf("gitignored build/ should have been removed on release, got err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wsPath, "test.log")); !os.IsNotExist(err) {
+		t.Errorf("gitignored test.log should have been removed on release, got err=%v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(wsPath, ".jj")); err != nil {
+		t.Errorf(".jj directory should be preserved after release: %v", err)
+	}
+}
+
 func TestPool_List(t *testing.T) {
 	repoPath := setupTestRepo(t)
 	workspacesDir := t.TempDir()

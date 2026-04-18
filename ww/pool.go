@@ -293,6 +293,10 @@ func (p *Pool) Release(wsPath string) error {
 }
 
 func (p *Pool) releaseToAvailable(wsPath string) error {
+	if err := cleanUntracked(p.jj, wsPath); err != nil {
+		return fmt.Errorf("clean untracked: %w", err)
+	}
+
 	if _, err := p.jj.NewChange(wsPath, "trunk()"); err != nil {
 		return fmt.Errorf("jj new trunk(): %w", err)
 	}
