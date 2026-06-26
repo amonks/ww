@@ -8,8 +8,8 @@ require (
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/term v0.43.0
 	modernc.org/sqlite v1.47.0
-	monks.co/pkg/jj v0.0.4
-	monks.co/pkg/migrate v0.0.1
+	monks.co/pkg/jj v0.0.5
+	monks.co/pkg/migrate v0.0.8
 )
 
 require (
