@@ -824,3 +824,132 @@ func TestPool_WorkspaceNameForPath_NotInWorkspace(t *testing.T) {
 		t.Fatalf("expected workspace root not found error, got %v", err)
 	}
 }
+
+// writeOnCreateHook writes a project ww.toml at repoPath whose on-create
+// script is the given shell body. A TOML multi-line literal string is used so
+// the body needs no escaping.
+func writeOnCreateHook(t *testing.T, repoPath, body string) {
+	t.Helper()
+	cfg := "[workspace]\non-create = '''\n" + body + "\n'''\n"
+	if err := os.WriteFile(filepath.Join(repoPath, "ww.toml"), []byte(cfg), 0644); err != nil {
+		t.Fatalf("write ww.toml: %v", err)
+	}
+}
+
+// TestPool_Acquire_RunsOnCreateHookOnEveryAcquire pins the behavior the repo's
+// own ww.toml depends on: the on-create hook regenerates per-workspace state
+// (.envrc.local, .envrc.secrets) and must therefore run on reuse of an
+// already-provisioned workspace, not only on first creation. A workspace that
+// silently skipped the hook would serve stale decrypted secrets.
+func TestPool_Acquire_RunsOnCreateHookOnEveryAcquire(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	workspacesDir := t.TempDir()
+	workspacesDir, _ = filepath.EvalSymlinks(workspacesDir)
+
+	// The marker lives outside the workspace: release deletes untracked files.
+	marker := filepath.Join(t.TempDir(), "runs")
+	t.Setenv("WW_TEST_MARKER", marker)
+	writeOnCreateHook(t, repoPath, `printf '%s\n' "$PWD" >> "$WW_TEST_MARKER"`)
+
+	pool := openPool(t, ww.Options{
+		StateDir:      t.TempDir(),
+		WorkspacesDir: workspacesDir,
+	})
+
+	wsPath, err := pool.Acquire(repoPath, acquireOptions())
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	if err := pool.Release(wsPath); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	wsPath2, err := pool.Acquire(repoPath, acquireOptions())
+	if err != nil {
+		t.Fatalf("second acquire: %v", err)
+	}
+	if wsPath2 != wsPath {
+		t.Fatalf("expected the pooled workspace to be reused, got %q then %q", wsPath, wsPath2)
+	}
+	if err := pool.Release(wsPath2); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected on-create to run once per acquire (2 runs), got %d: %q", len(lines), lines)
+	}
+	for i, line := range lines {
+		if normalizePath(line) != wsPath {
+			t.Errorf("run %d: expected hook cwd %q, got %q", i+1, wsPath, normalizePath(line))
+		}
+	}
+}
+
+// TestPool_Acquire_OnCreateHookFailureIsFatal ensures a failing hook aborts the
+// acquire and returns the workspace to the pool. Handing back a workspace whose
+// setup failed is how an agent would end up with stale or missing credentials.
+func TestPool_Acquire_OnCreateHookFailureIsFatal(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	workspacesDir := t.TempDir()
+	workspacesDir, _ = filepath.EvalSymlinks(workspacesDir)
+
+	writeOnCreateHook(t, repoPath, "exit 1")
+
+	pool := openPool(t, ww.Options{
+		StateDir:      t.TempDir(),
+		WorkspacesDir: workspacesDir,
+	})
+
+	if _, err := pool.Acquire(repoPath, acquireOptions()); err == nil {
+		t.Fatal("expected acquire to fail when the on-create hook exits non-zero")
+	} else if !strings.Contains(err.Error(), "on-create script") {
+		t.Fatalf("expected an on-create script error, got %v", err)
+	}
+
+	list, err := pool.List(repoPath)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 workspace, got %d", len(list))
+	}
+	if list[0].Status != ww.StatusAvailable {
+		t.Fatalf("expected the workspace to be released back to the pool, got status %s", list[0].Status)
+	}
+}
+
+// TestPool_Acquire_SkipHooksSkipsOnCreate documents that SkipHooks callers opt
+// out of per-workspace setup entirely.
+func TestPool_Acquire_SkipHooksSkipsOnCreate(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	workspacesDir := t.TempDir()
+	workspacesDir, _ = filepath.EvalSymlinks(workspacesDir)
+
+	marker := filepath.Join(t.TempDir(), "runs")
+	t.Setenv("WW_TEST_MARKER", marker)
+	writeOnCreateHook(t, repoPath, `printf 'ran\n' >> "$WW_TEST_MARKER"`)
+
+	pool := openPool(t, ww.Options{
+		StateDir:      t.TempDir(),
+		WorkspacesDir: workspacesDir,
+	})
+
+	opts := acquireOptions()
+	opts.SkipHooks = true
+	wsPath, err := pool.Acquire(repoPath, opts)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if err := pool.Release(wsPath); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("expected the on-create hook not to run with SkipHooks, marker stat err = %v", err)
+	}
+}
