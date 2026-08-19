@@ -1,0 +1,16 @@
+# This module publishes to a public mirror, so it is one of the modules
+# `publish-validate` checks with `GOWORK=off go mod tidy -diff` — a fresh
+# checkout of the mirror has no workspace to fall back on, so its go.mod and
+# go.sum have to stand alone. `go work sync` rewrites requirements across
+# every workspace module, but `generate` only re-tidies modules that own a
+# tidy task, so without this file the drift accumulated silently and surfaced
+# a whole CI cycle later at publish-validate (runs 1110, 1111).
+[[task]]
+  id = "tidy"
+  type = "short"
+  cmd = "go mod tidy -e"
+
+[[task]]
+  id = "generate"
+  type = "short"
+  dependencies = ["tidy"]
