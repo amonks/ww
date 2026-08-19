@@ -212,6 +212,11 @@ func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 	// Create the workspace directory if needed
 	if needsCreate {
 		if err := os.MkdirAll(filepath.Dir(wsPath), 0755); err != nil {
+			// Nothing exists on disk to hand back, so the row goes away
+			// entirely, as it does when jj declines to add the workspace.
+			if deleteErr := p.store.DeleteWorkspace(repoName, wsName); deleteErr != nil {
+				return "", fmt.Errorf("create workspace parent dir: %w; cleanup failed: %v", err, deleteErr)
+			}
 			return "", fmt.Errorf("create workspace parent dir: %w", err)
 		}
 
@@ -226,16 +231,31 @@ func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 
 	// Resolve the revision in the source repo first. This is necessary because
 	// symbolic refs like "@" have different meanings in the workspace vs source.
+	//
+	// The source repo's own working copy can be stale — a rewrite issued from
+	// a workspace does that to it — and then this resolution fails and a
+	// symbolic rev falls through to be resolved in the workspace instead,
+	// which is the mis-parenting the paragraph above warns about. Recovering
+	// the way an idle workspace is recovered is not open to us here: this is
+	// the operator's own checkout, and update-stale would take their
+	// unsnapshotted edits with it. The fallback is knowingly accepted.
 	resolvedRev, err := p.jj.ChangeIDAt(repoPath, opts.Rev)
 	if err != nil {
 		resolvedRev = opts.Rev // Fall back to original if resolution fails
 	}
 
 	newChange := func(parentRev string) (string, error) {
-		if strings.TrimSpace(opts.NewChangeMessage) != "" {
-			return p.jj.NewChangeWithMessage(wsPath, parentRev, opts.NewChangeMessage)
-		}
-		return p.jj.NewChange(wsPath, parentRev)
+		var rev string
+		err := p.withFreshWorkingCopy(wsPath, func() error {
+			var err error
+			if strings.TrimSpace(opts.NewChangeMessage) != "" {
+				rev, err = p.jj.NewChangeWithMessage(wsPath, parentRev, opts.NewChangeMessage)
+			} else {
+				rev, err = p.jj.NewChange(wsPath, parentRev)
+			}
+			return err
+		})
+		return rev, err
 	}
 
 	actualRev, err := newChange(resolvedRev)
@@ -249,13 +269,14 @@ func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 			actualRev, err = newChange(fallbackRev)
 		}
 		if err != nil {
+			p.returnAfterFailedAcquire(wsPath)
 			return "", fmt.Errorf("jj new: %w", err)
 		}
 	}
 
 	if actualRev != opts.Rev {
 		if err := p.store.UpdateWorkspaceRevision(repoName, wsName, actualRev, time.Now()); err != nil {
-			p.Release(wsPath)
+			p.returnAfterFailedAcquire(wsPath)
 			return "", fmt.Errorf("update workspace rev: %w", err)
 		}
 	}
@@ -264,24 +285,68 @@ func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 	if !opts.SkipHooks {
 		cfg, err := config.Load(repoPath)
 		if err != nil {
+			// A repo-level config fault fails every acquire, so leaking
+			// here empties the pool one workspace per attempt.
+			p.returnAfterFailedAcquire(wsPath)
 			return "", fmt.Errorf("load config: %w", err)
 		}
 
 		// Run on-create script for every acquire
 		if err := config.RunScript(wsPath, cfg.Workspace.OnCreate); err != nil {
-			p.Release(wsPath)
+			p.returnAfterFailedAcquire(wsPath)
 			return "", fmt.Errorf("on-create script: %w", err)
 		}
 
 		// Mark as provisioned if needed
 		if needsProvision {
 			if err := p.store.MarkWorkspaceProvisioned(repoName, wsName); err != nil {
+				p.returnAfterFailedAcquire(wsPath)
 				return "", fmt.Errorf("mark workspace provisioned: %w", err)
 			}
 		}
 	}
 
 	return wsPath, nil
+}
+
+// withFreshWorkingCopy runs a jj operation in an idle workspace, recovering
+// once from a working copy the repo has moved on from.
+//
+// A pooled workspace holds a parked change nobody is watching, and any
+// operation elsewhere that rewrites it — a rebase, a revert inserted ahead of
+// it, an undo of either — carries the repo's idea of the workspace away from
+// what is on disk. jj then refuses every command there until someone runs
+// update-stale. Nothing about that is the acquiring caller's doing, and the
+// recovery is mechanical, so the pool does it rather than handing the hint
+// out as an error.
+//
+// Only for a workspace nobody is using: update-stale drops working-copy edits
+// jj never snapshotted, which is free on a parked empty change and is not
+// free anywhere else.
+func (p *Pool) withFreshWorkingCopy(wsPath string, op func() error) error {
+	err := op()
+	if !jj.IsStaleWorkingCopy(err) {
+		return err
+	}
+	if updateErr := p.jj.WorkspaceUpdateStale(wsPath); updateErr != nil {
+		return fmt.Errorf("%w (update-stale: %v)", err, updateErr)
+	}
+	return op()
+}
+
+// returnAfterFailedAcquire hands a workspace back after an acquire that
+// claimed the state row and then failed. Without it a single failure retires
+// the workspace from the pool for good, holding a purpose that never ran and
+// a PID that has exited, and nothing ever cleans that up.
+//
+// The full release does jj work of its own, which can fail for whatever
+// reason the acquire did; the state row still has to be freed, so a failure
+// there falls back to flipping it directly.
+func (p *Pool) returnAfterFailedAcquire(wsPath string) {
+	if err := p.Release(wsPath); err == nil {
+		return
+	}
+	_ = p.store.ReleaseWorkspace(paths.NormalizePath(wsPath), time.Now())
 }
 
 // Release returns a workspace to the pool, making it available for reuse.
@@ -292,6 +357,10 @@ func (p *Pool) Release(wsPath string) error {
 	return p.releaseToAvailable(wsPath)
 }
 
+// A release deliberately does not recover a stale working copy the way an
+// acquire does. update-stale discards working-copy edits jj never snapshotted,
+// and a workspace being released may still hold a session's last writes; the
+// workspace stays acquired, which is the outcome its owner can inspect.
 func (p *Pool) releaseToAvailable(wsPath string) error {
 	if err := cleanUntracked(p.jj, wsPath); err != nil {
 		return fmt.Errorf("clean untracked: %w", err)

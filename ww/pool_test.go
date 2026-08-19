@@ -3,6 +3,7 @@ package ww_test
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -75,6 +76,50 @@ func ensureMainBookmark(t *testing.T, repoPath string) {
 	}
 	if err := client.BookmarkCreate(repoPath, "main", "@"); err != nil {
 		t.Fatalf("create main bookmark: %v", err)
+	}
+}
+
+// runJJ runs a raw jj command. pkg/jj's Rebase wraps `-b` only, and the
+// staleness tests need `-r` to rewrite one named change.
+func runJJ(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("jj", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("jj %s: %v: %s", strings.Join(args, " "), err, out)
+	}
+}
+
+// setupPoolWithMain builds a repo whose main carries a file, so a change
+// parked below it has a tree that a rewrite can change — which is what jj's
+// staleness check keys on — plus a pool over fresh directories.
+func setupPoolWithMain(t *testing.T) (string, *ww.Pool) {
+	t.Helper()
+	repoPath := setupTestRepo(t)
+	if err := os.WriteFile(filepath.Join(repoPath, "f.txt"), []byte("hello\n"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	client := jj.New()
+	if err := client.Describe(repoPath, "add f"); err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	ensureMainBookmark(t, repoPath)
+	if _, err := client.NewChange(repoPath, "@"); err != nil {
+		t.Fatalf("new change: %v", err)
+	}
+
+	workspacesDir := t.TempDir()
+	workspacesDir, _ = filepath.EvalSymlinks(workspacesDir)
+	return repoPath, openPool(t, ww.Options{StateDir: t.TempDir(), WorkspacesDir: workspacesDir})
+}
+
+// requireStale asserts a workspace really is in the state the staleness tests
+// mean to put it in. Without it a test that stops reproducing the condition —
+// a jj change, a drifted fixture — passes while proving nothing.
+func requireStale(t *testing.T, wsPath string) {
+	t.Helper()
+	if _, err := jj.New().CurrentChangeID(wsPath); !jj.IsStaleWorkingCopy(err) {
+		t.Fatalf("expected a stale working copy, got %v", err)
 	}
 }
 
@@ -951,5 +996,145 @@ func TestPool_Acquire_SkipHooksSkipsOnCreate(t *testing.T) {
 
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("expected the on-create hook not to run with SkipHooks, marker stat err = %v", err)
+	}
+}
+
+// A workspace idling in the pool holds a parked change that the source repo
+// can rewrite out from under it — a rebase, a revert inserted before it, an
+// undo of either. jj then refuses to touch that workspace until someone runs
+// update-stale, and the workspace it happens to is the next one Acquire hands
+// out, so the failure lands on a caller that did nothing wrong.
+func TestPool_Acquire_RecoversStaleWorkingCopy(t *testing.T) {
+	repoPath, pool := setupPoolWithMain(t)
+
+	wsPath, err := pool.Acquire(repoPath, acquireOptions())
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	wsName, err := pool.WorkspaceNameForPath(wsPath)
+	if err != nil {
+		t.Fatalf("workspace name: %v", err)
+	}
+	if err := pool.Release(wsPath); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	// Rewrite the parked change from the source repo, leaving the
+	// workspace's on-disk copy behind.
+	runJJ(t, repoPath, "rebase", "-r", wsName+"@", "-d", "main")
+	requireStale(t, wsPath)
+
+	reacquired, err := pool.Acquire(repoPath, acquireOptions())
+	if err != nil {
+		t.Fatalf("acquire after the parked change was rewritten: %v", err)
+	}
+	if reacquired != wsPath {
+		t.Fatalf("expected the pooled workspace %s, got %s", wsPath, reacquired)
+	}
+}
+
+// The same rewrite can land on a workspace that is checked out and in use,
+// where release does not paper over it: update-stale would drop whatever the
+// session wrote and jj never snapshotted, so the workspace stays acquired for
+// its owner to look at.
+func TestPool_Release_RefusesStaleWorkingCopy(t *testing.T) {
+	repoPath, pool := setupPoolWithMain(t)
+
+	wsPath, err := pool.Acquire(repoPath, acquireOptions())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	wsName, err := pool.WorkspaceNameForPath(wsPath)
+	if err != nil {
+		t.Fatalf("workspace name: %v", err)
+	}
+
+	// Rebasing off main empties the change's tree, so the on-disk copy no
+	// longer matches what the repo says the workspace is checked out to.
+	runJJ(t, repoPath, "rebase", "-r", wsName+"@", "-d", "root()")
+	requireStale(t, wsPath)
+
+	err = pool.Release(wsPath)
+	if err == nil {
+		t.Fatal("expected release of a stale workspace to fail")
+	}
+	if !jj.IsStaleWorkingCopy(err) {
+		t.Fatalf("expected a stale working copy error, got %v", err)
+	}
+	list, err := pool.List(repoPath)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 || list[0].Status != ww.StatusAcquired {
+		t.Fatalf("expected the workspace to stay acquired, got %+v", list)
+	}
+}
+
+// Acquire marks the state row before it does any jj work, so an acquire that
+// fails partway has to hand the workspace back. Leaving the row acquired
+// retires a workspace from the pool under a purpose that never ran, and
+// nothing ever cleans it up.
+func TestPool_Acquire_ReturnsWorkspaceWhenNewChangeFails(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	ensureMainBookmark(t, repoPath)
+
+	workspacesDir := t.TempDir()
+	workspacesDir, _ = filepath.EvalSymlinks(workspacesDir)
+	pool := openPool(t, ww.Options{StateDir: t.TempDir(), WorkspacesDir: workspacesDir})
+
+	if _, err := pool.Acquire(repoPath, ww.AcquireOptions{
+		Rev:     "no-such-rev",
+		Purpose: "doomed",
+	}); err == nil {
+		t.Fatal("expected acquire at a missing revision to fail")
+	}
+
+	list, err := pool.List(repoPath)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 workspace, got %d", len(list))
+	}
+	if list[0].Status != ww.StatusAvailable {
+		t.Fatalf("failed acquire leaked workspace %s in status %s", list[0].Name, list[0].Status)
+	}
+}
+
+// The same has to hold for a failure after the jj work, and this one is the
+// one that would actually be met: a broken config fails every acquire, so a
+// leak here drains the pool a workspace at a time and manufactures new ones
+// forever.
+func TestPool_Acquire_ReturnsWorkspaceWhenConfigFails(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	ensureMainBookmark(t, repoPath)
+	// config.Load rejects a repo carrying both config locations.
+	if err := os.WriteFile(filepath.Join(repoPath, "ww.toml"), []byte("[workspace]\n"), 0644); err != nil {
+		t.Fatalf("write ww.toml: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoPath, ".ww"), 0755); err != nil {
+		t.Fatalf("mkdir .ww: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, ".ww", "config.toml"), []byte("[workspace]\n"), 0644); err != nil {
+		t.Fatalf("write .ww/config.toml: %v", err)
+	}
+
+	workspacesDir := t.TempDir()
+	workspacesDir, _ = filepath.EvalSymlinks(workspacesDir)
+	pool := openPool(t, ww.Options{StateDir: t.TempDir(), WorkspacesDir: workspacesDir})
+
+	if _, err := pool.Acquire(repoPath, acquireOptions()); err == nil {
+		t.Fatal("expected acquire to fail on an unloadable config")
+	}
+
+	list, err := pool.List(repoPath)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 workspace, got %d", len(list))
+	}
+	if list[0].Status != ww.StatusAvailable {
+		t.Fatalf("failed acquire leaked workspace %s in status %s", list[0].Name, list[0].Status)
 	}
 }
