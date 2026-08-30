@@ -1033,11 +1033,17 @@ func TestPool_Acquire_RecoversStaleWorkingCopy(t *testing.T) {
 	}
 }
 
-// The same rewrite can land on a workspace that is checked out and in use,
-// where release does not paper over it: update-stale would drop whatever the
-// session wrote and jj never snapshotted, so the workspace stays acquired for
-// its owner to look at.
-func TestPool_Release_RefusesStaleWorkingCopy(t *testing.T) {
+// The same rewrite can land on a workspace that is checked out and in use.
+// Release recovers that one too, and the reason it is safe to is that
+// update-stale does not lose what the workspace was holding: it snapshots the
+// disk into a divergent commit under the change's own id first. So a stale
+// release preserves a session's last writes in the repo, where the row's Rev
+// already points, rather than dropping them.
+//
+// Release refused this case for a long time, on the belief that the edits were
+// destroyed. They are not, and the refusal cost a workspace stuck out of the
+// pool until someone cleared it by hand.
+func TestPool_Release_RecoversStaleWorkingCopyKeepingItsWork(t *testing.T) {
 	repoPath, pool := setupPoolWithMain(t)
 
 	wsPath, err := pool.Acquire(repoPath, acquireOptions())
@@ -1049,24 +1055,158 @@ func TestPool_Release_RefusesStaleWorkingCopy(t *testing.T) {
 		t.Fatalf("workspace name: %v", err)
 	}
 
+	// Work jj has not snapshotted, of the kind a session would leave.
+	const work = "PRECIOUS SESSION WORK\n"
+	if err := os.WriteFile(filepath.Join(wsPath, "f.txt"), []byte(work), 0644); err != nil {
+		t.Fatalf("write work: %v", err)
+	}
+
 	// Rebasing off main empties the change's tree, so the on-disk copy no
 	// longer matches what the repo says the workspace is checked out to.
 	runJJ(t, repoPath, "rebase", "-r", wsName+"@", "-d", "root()")
 	requireStale(t, wsPath)
 
-	err = pool.Release(wsPath)
-	if err == nil {
-		t.Fatal("expected release of a stale workspace to fail")
+	if err := pool.Release(wsPath); err != nil {
+		t.Fatalf("release of a stale workspace: %v", err)
 	}
-	if !jj.IsStaleWorkingCopy(err) {
-		t.Fatalf("expected a stale working copy error, got %v", err)
-	}
+
 	list, err := pool.List(repoPath)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if len(list) != 1 || list[0].Status != ww.StatusAcquired {
-		t.Fatalf("expected the workspace to stay acquired, got %+v", list)
+	if len(list) != 1 || list[0].Status != ww.StatusAvailable {
+		t.Fatalf("expected the workspace back in the pool, got %+v", list)
+	}
+	if _, err := jj.New().CurrentChangeID(wsPath); err != nil {
+		t.Fatalf("workspace still unusable after release: %v", err)
+	}
+
+	// The work is still in the repo, and says where it came from — an
+	// undescribed head under a divergent id is not something anyone would
+	// recognize as their own session's last writes.
+	client := jj.New()
+	commits, err := client.CommitIDsForRevset(repoPath, "all()")
+	if err != nil {
+		t.Fatalf("list commits: %v", err)
+	}
+	var found string
+	for _, c := range commits {
+		if b, err := client.FileShow(repoPath, c, "f.txt"); err == nil && string(b) == work {
+			found = c
+		}
+	}
+	if found == "" {
+		t.Fatal("the unsnapshotted work did not survive the release")
+	}
+	desc, err := client.DescriptionAt(repoPath, found)
+	if err != nil {
+		t.Fatalf("description: %v", err)
+	}
+	if !strings.Contains(desc, wsName) || !strings.Contains(desc, "stale") {
+		t.Errorf("recovered work described as %q, want it to name %s and say it went stale", desc, wsName)
+	}
+}
+
+// The common case by far: staleness lands in bulk on idle workspaces, whose
+// parked change is empty. There is nothing to recover, and the recovery must
+// leave no sibling under that change's id — an empty one would be residue per
+// stale release, and nameRecoveredWork declines to describe an empty commit, so
+// only counting commits can see it.
+func TestPool_Release_StaleButEmptyLeavesNothingBehind(t *testing.T) {
+	repoPath, pool := setupPoolWithMain(t)
+
+	wsPath, err := pool.Acquire(repoPath, acquireOptions())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	wsName, err := pool.WorkspaceNameForPath(wsPath)
+	if err != nil {
+		t.Fatalf("workspace name: %v", err)
+	}
+	client := jj.New()
+	// While the workspace is still readable: the rewrite below keeps the id.
+	changeID, err := client.ChangeIDAt(wsPath, "@")
+	if err != nil {
+		t.Fatalf("change id: %v", err)
+	}
+
+	runJJ(t, repoPath, "rebase", "-r", wsName+"@", "-d", "root()")
+	requireStale(t, wsPath)
+
+	before, err := client.CommitIDsForRevset(repoPath, "change_id("+changeID+")")
+	if err != nil {
+		t.Fatalf("list commits: %v", err)
+	}
+
+	if err := pool.Release(wsPath); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	after, err := client.CommitIDsForRevset(repoPath, "change_id("+changeID+")")
+	if err != nil {
+		t.Fatalf("list commits: %v", err)
+	}
+	for _, c := range after {
+		if !slices.Contains(before, c) {
+			desc, _ := client.DescriptionAt(repoPath, c)
+			t.Errorf("empty stale release left a sibling %s under the parked change: %q", c, desc)
+		}
+	}
+}
+
+// A change can be divergent before anything goes stale — two concurrent
+// operations elsewhere rewriting it is enough — so the commits under its id
+// after a recovery are not all the recovery's doing. Naming one of the others
+// would put this workspace's name on an unrelated commit, and DescribeAt
+// rewrites what it describes and rebases its descendants: a repair for one
+// stale workspace would make another one stale.
+func TestPool_Release_StaleAlreadyDivergentNamesOnlyWhatItRecovered(t *testing.T) {
+	repoPath, pool := setupPoolWithMain(t)
+
+	wsPath, err := pool.Acquire(repoPath, acquireOptions())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	client := jj.New()
+	changeID, err := client.ChangeIDAt(wsPath, "@")
+	if err != nil {
+		t.Fatalf("change id: %v", err)
+	}
+
+	// Give the change a second, non-empty, undescribed incarnation that has
+	// nothing to do with any recovery — the shape nameRecoveredWork must not
+	// touch. Two operations racing from the same parent op diverge it.
+	if err := os.WriteFile(filepath.Join(wsPath, "unrelated.txt"), []byte("elsewhere\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	runJJ(t, wsPath, "status")
+	runJJ(t, repoPath, "--at-operation", "@", "rebase", "-r", changeID, "-d", "root()")
+	runJJ(t, repoPath, "--at-operation", "@-", "rebase", "-r", changeID, "-d", "main")
+
+	divergent, err := client.CommitIDsForRevset(repoPath, "change_id("+changeID+")")
+	if err != nil {
+		t.Fatalf("list divergent: %v", err)
+	}
+	if len(divergent) < 2 {
+		t.Skipf("expected the change to be divergent before release, got %d commits", len(divergent))
+	}
+	// Nothing on disk is unsnapshotted here — the divergence came from the
+	// concurrent rewrites, not from the workspace — so a correct recovery
+	// creates no commit and names nothing. Assert on that rather than on the
+	// pre-existing ids: describing a commit changes its id, so a check that
+	// looked them up afterwards would miss exactly the damage it is for.
+	if err := pool.Release(wsPath); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	commits, err := client.CommitIDsForRevset(repoPath, "all()")
+	if err != nil {
+		t.Fatalf("list commits: %v", err)
+	}
+	for _, c := range commits {
+		if desc, err := client.DescriptionAt(repoPath, c); err == nil && strings.Contains(desc, "recovered from") {
+			t.Errorf("release named pre-existing divergence as recovered work: %s %q", c, desc)
+		}
 	}
 }
 

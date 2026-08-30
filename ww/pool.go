@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -236,9 +237,13 @@ func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 	// a workspace does that to it — and then this resolution fails and a
 	// symbolic rev falls through to be resolved in the workspace instead,
 	// which is the mis-parenting the paragraph above warns about. Recovering
-	// the way an idle workspace is recovered is not open to us here: this is
-	// the operator's own checkout, and update-stale would take their
-	// unsnapshotted edits with it. The fallback is knowingly accepted.
+	// the way a pool workspace is recovered is not open to us here. Not
+	// because update-stale would lose their edits — it would not, it keeps
+	// them in a divergent commit — but because it wipes the working copy on
+	// the way, taking the untracked files with it. In a pool workspace that
+	// is the point, since a release deletes them anyway; in the operator's
+	// own checkout it is their build output, their editor state, their
+	// .envrc.secrets. The fallback is knowingly accepted.
 	resolvedRev, err := p.jj.ChangeIDAt(repoPath, opts.Rev)
 	if err != nil {
 		resolvedRev = opts.Rev // Fall back to original if resolution fails
@@ -309,29 +314,84 @@ func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 	return wsPath, nil
 }
 
-// withFreshWorkingCopy runs a jj operation in an idle workspace, recovering
-// once from a working copy the repo has moved on from.
+// withFreshWorkingCopy runs a jj operation in a workspace, recovering once
+// from a working copy the repo has moved on from.
 //
 // A pooled workspace holds a parked change nobody is watching, and any
 // operation elsewhere that rewrites it — a rebase, a revert inserted ahead of
 // it, an undo of either — carries the repo's idea of the workspace away from
-// what is on disk. jj then refuses every command there until someone runs
-// update-stale. Nothing about that is the acquiring caller's doing, and the
-// recovery is mechanical, so the pool does it rather than handing the hint
-// out as an error.
+// what is on disk. jj then refuses every command that touches the working copy
+// there until someone runs update-stale. Nothing about that is the caller's
+// doing, and the recovery is mechanical, so the pool does it rather than
+// handing the hint out as an error.
 //
-// Only for a workspace nobody is using: update-stale drops working-copy edits
-// jj never snapshotted, which is free on a parked empty change and is not
-// free anywhere else.
+// update-stale wipes the working copy, but it does not lose what was on it:
+// it snapshots the disk into a divergent commit sharing the workspace change's
+// id, then moves the working copy to the rewritten one. On a parked empty
+// change — the common case, since staleness lands in bulk on idle workspaces —
+// the divergent commit is empty too and the caller's `jj new` abandons it,
+// leaving nothing behind. Where the workspace really was holding unsnapshotted
+// work, that commit is the only record of it, so nameRecoveredWork describes it
+// on the way past.
 func (p *Pool) withFreshWorkingCopy(wsPath string, op func() error) error {
 	err := op()
 	if !jj.IsStaleWorkingCopy(err) {
 		return err
 	}
+	// Read before recovering, so nameRecoveredWork can tell the commit this
+	// update-stale creates from any the change already had.
+	before, beforeErr := p.jj.WorkingCopyChangeCommitIDs(wsPath)
 	if updateErr := p.jj.WorkspaceUpdateStale(wsPath); updateErr != nil {
 		return fmt.Errorf("%w (update-stale: %v)", err, updateErr)
 	}
+	if beforeErr == nil {
+		p.nameRecoveredWork(wsPath, before)
+	}
 	return op()
+}
+
+// nameRecoveredWork describes the commit update-stale just snapshotted a stale
+// working copy into, when there was anything on it to snapshot. before is the
+// change's commits as they stood before the recovery.
+//
+// Without this the work survives as an undescribed head under a change id that
+// now has two commits — findable only by someone who already knows to look for
+// it, and indistinguishable in `jj log` from junk worth abandoning. Naming it
+// is what turns "your edits are somewhere" into a change anyone can read.
+//
+// Only a commit the recovery actually created is named. A change can be
+// divergent for reasons of its own — two concurrent operations elsewhere
+// rewriting it — and describing one of those would be worse than saying
+// nothing: it would put this workspace's name on an unrelated commit, and
+// DescribeAt rewrites what it describes and rebases its descendants, which is
+// how a repair for one stale workspace would make another one stale.
+//
+// A commit that already carries a description is left alone too. That is a
+// session's own change, rewritten rather than recovered; overwriting what its
+// author wrote to announce the recovery would lose more than it explains.
+//
+// Best-effort throughout: this runs inside a recovery the caller did not ask
+// for, and failing to label the commit is not a reason to fail the release
+// that saved it. The empty case is the common one and does nothing at all.
+func (p *Pool) nameRecoveredWork(wsPath string, before []string) {
+	after, err := p.jj.WorkingCopyChangeCommitIDs(wsPath)
+	if err != nil {
+		return
+	}
+	for _, commit := range after {
+		if slices.Contains(before, commit) {
+			continue
+		}
+		if empty, err := p.jj.ChangeEmptyAt(wsPath, commit); err != nil || empty {
+			continue
+		}
+		if desc, err := p.jj.DescriptionAt(wsPath, commit); err != nil || strings.TrimSpace(desc) != "" {
+			continue
+		}
+		_ = p.jj.DescribeAt(wsPath, commit, fmt.Sprintf(
+			"ww: work recovered from %s, which went stale before jj snapshotted it",
+			filepath.Base(wsPath)))
+	}
 }
 
 // returnAfterFailedAcquire hands a workspace back after an acquire that
@@ -357,17 +417,35 @@ func (p *Pool) Release(wsPath string) error {
 	return p.releaseToAvailable(wsPath)
 }
 
-// A release deliberately does not recover a stale working copy the way an
-// acquire does. update-stale discards working-copy edits jj never snapshotted,
-// and a workspace being released may still hold a session's last writes; the
-// workspace stays acquired, which is the outcome its owner can inspect.
+// releaseToAvailable cleans the workspace, parks it on a fresh change at
+// trunk(), and frees its state row.
+//
+// It recovers a stale working copy the same way an acquire does, because
+// update-stale does not lose the work it looks like it loses: it snapshots
+// whatever the disk holds into a divergent commit under the workspace change's
+// own id before moving the working copy, so a release preserves a session's
+// last writes rather than discarding them. What it does drop — untracked,
+// ignored files — a release deletes anyway (see cleanUntracked), so a stale
+// release costs nothing a plain one does not.
+//
+// Recovery is therefore not a judgment call, and the pool does not put one to
+// anyone. It used to: release refused a stale workspace and left the operator
+// to clear it by hand, on the belief that update-stale destroyed unsnapshotted
+// edits. It does not, and the refusal bought nothing — while costing a
+// workspace stuck out of the pool, and a fault reported to whoever pressed the
+// button.
 func (p *Pool) releaseToAvailable(wsPath string) error {
-	if err := cleanUntracked(p.jj, wsPath); err != nil {
-		return fmt.Errorf("clean untracked: %w", err)
-	}
-
-	if _, err := p.jj.NewChange(wsPath, "trunk()"); err != nil {
-		return fmt.Errorf("jj new trunk(): %w", err)
+	err := p.withFreshWorkingCopy(wsPath, func() error {
+		if err := cleanUntracked(p.jj, wsPath); err != nil {
+			return fmt.Errorf("clean untracked: %w", err)
+		}
+		if _, err := p.jj.NewChange(wsPath, "trunk()"); err != nil {
+			return fmt.Errorf("jj new trunk(): %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	wsPath = paths.NormalizePath(wsPath)
