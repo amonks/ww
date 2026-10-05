@@ -20,8 +20,10 @@ import (
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		var exitErr interface{ ExitCode() int }
-		if errors.As(err, &exitErr) {
+		if exitErr, ok := errors.AsType[interface {
+			error
+			ExitCode() int
+		}](err); ok {
 			os.Exit(exitErr.ExitCode())
 		}
 		os.Exit(1)
@@ -294,8 +296,7 @@ func runExec(cmd *cobra.Command, args []string) error {
 	close(ch)
 
 	if cmdErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(cmdErr, &exitErr) {
+		if exitErr, ok := errors.AsType[*exec.ExitError](cmdErr); ok {
 			return exitError{code: exitErr.ExitCode()}
 		}
 		return cmdErr
