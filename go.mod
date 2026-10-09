@@ -8,8 +8,8 @@ require (
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/term v0.46.0
 	modernc.org/sqlite v1.56.0
-	monks.co/pkg/jj v0.0.4
-	monks.co/pkg/migrate v0.0.1
+	monks.co/pkg/jj v0.0.16
+	monks.co/pkg/migrate v0.0.17
 )
 
 require (
@@ -20,8 +20,9 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/tools v0.50.0 // indirect
 	modernc.org/libc v1.74.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
