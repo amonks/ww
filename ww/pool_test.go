@@ -13,6 +13,39 @@ import (
 	"monks.co/ww/ww"
 )
 
+// TestMain points HOME at a scratch directory for the whole package. Several
+// tests open the pool at its default paths, which live under HOME, and a test
+// run must never read or write the operator's real pool state. jj's user
+// config lives under HOME too, so it gets one of its own.
+func TestMain(m *testing.M) {
+	home, err := os.MkdirTemp("", "ww-test-home-")
+	if err != nil {
+		panic(err)
+	}
+	jjConfig := filepath.Join(home, "jj.toml")
+	if err := os.WriteFile(jjConfig, []byte("user.name = \"t\"\nuser.email = \"t@example.com\"\n"), 0o644); err != nil {
+		panic(err)
+	}
+	os.Setenv("HOME", home)
+	os.Setenv("JJ_CONFIG", jjConfig)
+	code := m.Run()
+	os.RemoveAll(home)
+	os.Exit(code)
+}
+
+// workspaceName names the pool workspace at wsPath.
+func workspaceName(t *testing.T, pool *ww.Pool, wsPath string) string {
+	t.Helper()
+	loc, err := pool.Locate(wsPath)
+	if err != nil {
+		t.Fatalf("locate %s: %v", wsPath, err)
+	}
+	if loc.Workspace == "" {
+		t.Fatalf("%s is not a pool workspace", wsPath)
+	}
+	return loc.Workspace
+}
+
 // normalizePath resolves symlinks and strips macOS /private prefix,
 // matching the behavior of ww's internal paths.NormalizePath.
 func normalizePath(path string) string {
@@ -270,6 +303,31 @@ func TestPool_Acquire_MissingChangeIDFallsBackToMain(t *testing.T) {
 
 	if err := pool.Release(wsPath); err != nil {
 		t.Fatalf("failed to release workspace: %v", err)
+	}
+}
+
+// The fallback is for a bare change ID. A change asked for by revset —
+// change_id(...), which is how the CLI hands on a --rev it pinned inside a
+// workspace — is meant exactly, and a missing one is an error.
+func TestPool_Acquire_MissingChangeIDRevsetDoesNotFallBack(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	ensureMainBookmark(t, repoPath)
+	workspacesDir, _ := filepath.EvalSymlinks(t.TempDir())
+	pool := openPool(t, ww.Options{StateDir: t.TempDir(), WorkspacesDir: workspacesDir})
+
+	if _, err := pool.Acquire(repoPath, ww.AcquireOptions{
+		Purpose: "test purpose",
+		Rev:     "change_id(kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk)",
+	}); err == nil {
+		t.Fatal("acquire on a missing change_id() revset succeeded")
+	}
+
+	list, err := pool.List(repoPath)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 || list[0].Status != ww.StatusAvailable {
+		t.Fatalf("expected the workspace handed back, got %+v", list)
 	}
 }
 
@@ -685,30 +743,6 @@ func TestPool_DefaultOptions(t *testing.T) {
 	}
 }
 
-func TestRepoRoot(t *testing.T) {
-	repoPath := setupTestRepo(t)
-
-	root, err := ww.RepoRoot(repoPath)
-	if err != nil {
-		t.Fatalf("failed to get repo root: %v", err)
-	}
-
-	// RepoRoot returns normalized paths (without macOS /private prefix).
-	expected := normalizePath(repoPath)
-	if root != expected {
-		t.Errorf("expected %q, got %q", expected, root)
-	}
-}
-
-func TestRepoRoot_NotARepo(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	_, err := ww.RepoRoot(tmpDir)
-	if err == nil {
-		t.Error("expected error for non-repo directory")
-	}
-}
-
 func TestRepoRootFromPath_Workspace(t *testing.T) {
 	repoPath := setupTestRepo(t)
 	workspacesDir := t.TempDir()
@@ -732,8 +766,9 @@ func TestRepoRootFromPath_Workspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to resolve repo root: %v", err)
 	}
-	if root != repoPath {
-		t.Fatalf("expected repo path %q, got %q", repoPath, root)
+	// RepoRootFromPath returns normalized paths (without macOS /private prefix).
+	if expected := normalizePath(repoPath); root != expected {
+		t.Fatalf("expected repo path %q, got %q", expected, root)
 	}
 }
 
@@ -833,40 +868,157 @@ func TestPool_DestroyAll_NoWorkspaces(t *testing.T) {
 	}
 }
 
-func TestPool_WorkspaceNameForPath(t *testing.T) {
-	repoPath := setupTestRepo(t)
-	workspacesDir := t.TempDir()
-	workspacesDir, _ = filepath.EvalSymlinks(workspacesDir)
-	stateDir := t.TempDir()
-
-	pool := openPool(t, ww.Options{
-		StateDir:      stateDir,
-		WorkspacesDir: workspacesDir,
-	})
-
-	wsPath, err := pool.Acquire(repoPath, acquireOptions())
-	if err != nil {
-		t.Fatalf("failed to acquire workspace: %v", err)
+// workspacesDirs returns a fresh workspaces directory two ways: plainly, and
+// reached through a symlink, as thor reaches /home through /usr/home. jj
+// reports a workspace root with symlinks resolved, while the pool records the
+// path it built, so the two spellings of a workspace differ in the second.
+func workspacesDirs(t *testing.T) map[string]string {
+	t.Helper()
+	plain, _ := filepath.EvalSymlinks(t.TempDir())
+	base, _ := filepath.EvalSymlinks(t.TempDir())
+	target := filepath.Join(base, "target")
+	if err := os.Mkdir(target, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
 	}
-
-	name, err := pool.WorkspaceNameForPath(wsPath)
-	if err != nil {
-		t.Fatalf("failed to resolve workspace name: %v", err)
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
 	}
-	if name == "" {
-		t.Fatal("expected workspace name")
+	return map[string]string{"plain": plain, "symlinked": link}
+}
+
+func TestPool_Locate(t *testing.T) {
+	for kind, workspacesDir := range workspacesDirs(t) {
+		t.Run(kind, func(t *testing.T) {
+			repoPath := setupTestRepo(t)
+			pool := openPool(t, ww.Options{StateDir: t.TempDir(), WorkspacesDir: workspacesDir})
+
+			wsPath, err := pool.Acquire(repoPath, acquireOptions())
+			if err != nil {
+				t.Fatalf("acquire: %v", err)
+			}
+			for _, dir := range []string{filepath.Join(repoPath, "sub"), filepath.Join(wsPath, "sub")} {
+				if err := os.Mkdir(dir, 0755); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+			}
+
+			source := ww.Location{Repo: normalizePath(repoPath)}
+			inWorkspace := ww.Location{Repo: normalizePath(repoPath), Workspace: "ws-001"}
+			for _, tc := range []struct {
+				path string
+				want ww.Location
+			}{
+				{repoPath, source},
+				{filepath.Join(repoPath, "sub"), source},
+				// jj's own answer here is the workspace root; the pool's is
+				// the repo the workspace was made from.
+				{wsPath, inWorkspace},
+				{filepath.Join(wsPath, "sub"), inWorkspace},
+			} {
+				got, err := pool.Locate(tc.path)
+				if err != nil {
+					t.Fatalf("locate %s: %v", tc.path, err)
+				}
+				if got != tc.want {
+					t.Errorf("locate %s: got %+v, want %+v", tc.path, got, tc.want)
+				}
+			}
+		})
 	}
 }
 
-func TestPool_WorkspaceNameForPath_NotInWorkspace(t *testing.T) {
-	pool := openDefaultPool(t)
+func TestPool_Locate_NotARepo(t *testing.T) {
+	pool := openPool(t, ww.Options{StateDir: t.TempDir(), WorkspacesDir: t.TempDir()})
 
-	_, err := pool.WorkspaceNameForPath(t.TempDir())
-	if err == nil {
-		t.Fatal("expected error for non-workspace directory")
-	}
+	_, err := pool.Locate(t.TempDir())
 	if !errors.Is(err, ww.ErrWorkspaceRootNotFound) {
 		t.Fatalf("expected workspace root not found error, got %v", err)
+	}
+}
+
+// A jj workspace sitting where the pool puts its own, with no row on record,
+// is a pool workspace whose state was lost. Taking it for a source repo would
+// register it as one; it is refused instead. A repo nested deeper is not in a
+// workspace's place and is its own repo.
+func TestPool_Locate_UnrecordedWorkspaceSlot(t *testing.T) {
+	for kind, workspacesDir := range workspacesDirs(t) {
+		t.Run(kind, func(t *testing.T) {
+			repoPath := setupTestRepo(t)
+			pool := openPool(t, ww.Options{StateDir: t.TempDir(), WorkspacesDir: workspacesDir})
+
+			orphan := filepath.Join(workspacesDir, "some-repo", "ws-009")
+			if err := os.MkdirAll(orphan, 0755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := jj.New().Init(orphan); err != nil {
+				t.Fatalf("init orphan: %v", err)
+			}
+			if _, err := pool.Locate(orphan); !errors.Is(err, ww.ErrRepoPathNotFound) {
+				t.Fatalf("locate unrecorded workspace slot: expected ErrRepoPathNotFound, got %v", err)
+			}
+
+			wsPath, err := pool.Acquire(repoPath, acquireOptions())
+			if err != nil {
+				t.Fatalf("acquire: %v", err)
+			}
+			nested := filepath.Join(wsPath, "scratch")
+			if err := os.Mkdir(nested, 0755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := jj.New().Init(nested); err != nil {
+				t.Fatalf("init nested: %v", err)
+			}
+			got, err := pool.Locate(nested)
+			if err != nil {
+				t.Fatalf("locate nested repo: %v", err)
+			}
+			resolved, _ := filepath.EvalSymlinks(nested)
+			if want := (ww.Location{Repo: normalizePath(resolved)}); got != want {
+				t.Fatalf("locate nested repo: got %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+// Handing a pool workspace to a repo-keyed call in place of its source repo
+// is refused, rather than registering the workspace as a repo with a pool of
+// its own.
+func TestPool_RefusesAWorkspaceAsASourceRepo(t *testing.T) {
+	for kind, workspacesDir := range workspacesDirs(t) {
+		t.Run(kind, func(t *testing.T) {
+			repoPath := setupTestRepo(t)
+			pool := openPool(t, ww.Options{StateDir: t.TempDir(), WorkspacesDir: workspacesDir})
+
+			wsPath, err := pool.Acquire(repoPath, acquireOptions())
+			if err != nil {
+				t.Fatalf("acquire: %v", err)
+			}
+
+			// Both spellings of the path: as the pool built it, and as jj
+			// reports it, with symlinks resolved.
+			resolved, _ := filepath.EvalSymlinks(wsPath)
+			for _, path := range []string{wsPath, resolved} {
+				if _, err := pool.Acquire(path, acquireOptions()); !errors.Is(err, ww.ErrNotSourceRepo) {
+					t.Errorf("acquire with workspace %s as repo: expected ErrNotSourceRepo, got %v", path, err)
+				}
+				if _, err := pool.List(path); !errors.Is(err, ww.ErrNotSourceRepo) {
+					t.Errorf("list with workspace %s as repo: expected ErrNotSourceRepo, got %v", path, err)
+				}
+				// What the refusal turns away, Locate resolves.
+				if loc, err := pool.Locate(path); err != nil || loc.Workspace != "ws-001" {
+					t.Errorf("locate %s: got %+v, %v; want ws-001", path, loc, err)
+				}
+			}
+
+			list, err := pool.List(repoPath)
+			if err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			if len(list) != 1 {
+				t.Fatalf("expected the source repo's one workspace, got %d", len(list))
+			}
+		})
 	}
 }
 
@@ -1011,10 +1163,7 @@ func TestPool_Acquire_RecoversStaleWorkingCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
-	wsName, err := pool.WorkspaceNameForPath(wsPath)
-	if err != nil {
-		t.Fatalf("workspace name: %v", err)
-	}
+	wsName := workspaceName(t, pool, wsPath)
 	if err := pool.Release(wsPath); err != nil {
 		t.Fatalf("release: %v", err)
 	}
@@ -1050,10 +1199,7 @@ func TestPool_Release_RecoversStaleWorkingCopyKeepingItsWork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	wsName, err := pool.WorkspaceNameForPath(wsPath)
-	if err != nil {
-		t.Fatalf("workspace name: %v", err)
-	}
+	wsName := workspaceName(t, pool, wsPath)
 
 	// Work jj has not snapshotted, of the kind a session would leave.
 	const work = "PRECIOUS SESSION WORK\n"
@@ -1119,10 +1265,7 @@ func TestPool_Release_StaleButEmptyLeavesNothingBehind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	wsName, err := pool.WorkspaceNameForPath(wsPath)
-	if err != nil {
-		t.Fatalf("workspace name: %v", err)
-	}
+	wsName := workspaceName(t, pool, wsPath)
 	client := jj.New()
 	// While the workspace is still readable: the rewrite below keeps the id.
 	changeID, err := client.ChangeIDAt(wsPath, "@")

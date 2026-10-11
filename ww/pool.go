@@ -581,14 +581,13 @@ func looksLikeChangeID(rev string) bool {
 	return true
 }
 
-// RepoRoot returns the jj repository root for the given path.
+// workspaceRoot returns the root of the jj workspace containing path,
+// normalized to handle macOS symlinks like /private/var.
 //
-// This can be used to find the repository root before calling Acquire.
-// Returns an error if the path is not inside a jj repository.
-// The returned path is normalized to handle macOS symlinks like /private/var.
-func RepoRoot(path string) (string, error) {
-	client := jj.New()
-	root, err := client.WorkspaceRoot(path)
+// Inside a pool workspace that is the workspace itself, not the repo it was
+// made from; Locate is the answer for anything keyed on the repo.
+func workspaceRoot(path string) (string, error) {
+	root, err := jj.New().WorkspaceRoot(path)
 	if err != nil {
 		return "", err
 	}
@@ -602,40 +601,19 @@ func resolveDBPath(stateDir string) (string, error) {
 	return paths.DefaultDBPath()
 }
 
-// RepoRootFromPath returns the source repo root for a workspace or repo path.
-// If the path is a workspace, it resolves to the original repo using state.
+// RepoRootFromPath returns the source repo for a path, as Locate does, opening
+// the default pool to answer it.
 func RepoRootFromPath(path string) (string, error) {
-	return repoRootFromPathWithOptions(path, Options{})
+	return RepoRootFromPathWithOptions(path, Options{})
 }
 
 // RepoRootFromPathWithOptions is like RepoRootFromPath with custom options.
 func RepoRootFromPathWithOptions(path string, opts Options) (string, error) {
-	return repoRootFromPathWithOptions(path, opts)
-}
-
-// WorkspaceNameForPath returns the workspace name for a workspace path.
-// Returns ErrWorkspaceRootNotFound if the path is not a workspace.
-func (p *Pool) WorkspaceNameForPath(path string) (string, error) {
-	root, err := RepoRoot(path)
+	// Outside any jj repo there is nothing to ask the pool, so that is
+	// settled before opening, and perhaps creating, its state.
+	root, err := workspaceRoot(path)
 	if err != nil {
-		return "", ErrWorkspaceRootNotFound
-	}
-
-	root = filepath.Clean(root)
-	ws, err := p.store.GetWorkspaceByPath(root)
-	if err != nil {
-		return "", err
-	}
-	if ws == nil {
-		return "", ErrRepoPathNotFound
-	}
-	return ws.Name, nil
-}
-
-func repoRootFromPathWithOptions(path string, opts Options) (string, error) {
-	root, err := RepoRoot(path)
-	if err != nil {
-		return "", ErrWorkspaceRootNotFound
+		return "", fmt.Errorf("%w: %v", ErrWorkspaceRootNotFound, err)
 	}
 
 	pool, err := OpenWithOptions(opts)
@@ -644,24 +622,81 @@ func repoRootFromPathWithOptions(path string, opts Options) (string, error) {
 	}
 	defer pool.Close()
 
-	repoPath, found, err := pool.store.RepoPathForWorkspace(root)
+	loc, err := pool.locateRoot(root)
 	if err != nil {
 		return "", err
 	}
+	return loc.Repo, nil
+}
 
+// Location is where a path sits relative to the pool.
+type Location struct {
+	// Repo is the source repo the path belongs to: the repo every
+	// repo-keyed call (Acquire, List, ReleaseByName, DestroyAll) takes.
+	// Inside a pool workspace it is the repo the workspace was created from.
+	Repo string
+
+	// Workspace names the pool workspace containing the path, or is empty
+	// when the path is not inside one.
+	Workspace string
+}
+
+// Locate resolves a path against the pool: the source repo it belongs to, and
+// the pool workspace it is in, if any.
+//
+// jj alone cannot answer this. Inside a pool workspace `jj workspace root`
+// names the workspace, and a workspace passed where a source repo belongs is
+// refused with ErrNotSourceRepo. So a path's workspace root is looked up in
+// the pool's state first, and only taken for the repo when it is not a pool
+// workspace.
+//
+// Returns ErrWorkspaceRootNotFound when path is not in a jj workspace at all,
+// and ErrRepoPathNotFound when its workspace root sits where the pool puts its
+// workspaces but nothing is on record there — a workspace whose state was
+// lost, which taking for a source repo would register as one.
+func (p *Pool) Locate(path string) (Location, error) {
+	root, err := workspaceRoot(path)
+	if err != nil {
+		return Location{}, fmt.Errorf("%w: %v", ErrWorkspaceRootNotFound, err)
+	}
+	return p.locateRoot(root)
+}
+
+// locateRoot is Locate for a path already resolved to its jj workspace root.
+func (p *Pool) locateRoot(root string) (Location, error) {
+	name, sourcePath, found, err := p.store.WorkspaceAt(root)
+	if err != nil {
+		return Location{}, err
+	}
 	if found {
-		if repoPath == "" {
-			return "", ErrRepoPathNotFound
-		}
-		return repoPath, nil
+		return Location{Repo: paths.NormalizePath(sourcePath), Workspace: name}, nil
 	}
 
-	rel, err := filepath.Rel(pool.workspacesDir, root)
-	if err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
-		return "", ErrRepoPathNotFound
+	if p.isWorkspaceSlot(root) {
+		return Location{}, fmt.Errorf("%w: no workspace is on record at %s", ErrRepoPathNotFound, root)
 	}
+	return Location{Repo: root}, nil
+}
 
-	return root, nil
+// isWorkspaceSlot reports whether dir is where the pool would put a workspace:
+// <workspaces dir>/<repo>/<name>. A repo nested deeper, inside a workspace's
+// checkout, is not in a workspace's place and is a repo of its own.
+//
+// Both sides are compared with symlinks resolved, since dir comes from jj,
+// which resolves them, and the workspaces directory may be reached through one.
+func (p *Pool) isWorkspaceSlot(dir string) bool {
+	workspacesDir := p.workspacesDir
+	if resolved, err := filepath.EvalSymlinks(workspacesDir); err == nil {
+		workspacesDir = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+	rel, err := filepath.Rel(workspacesDir, dir)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return len(strings.Split(rel, string(filepath.Separator))) == 2
 }
 
 // DestroyAll removes all workspaces for the given repository.

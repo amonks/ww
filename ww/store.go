@@ -22,8 +22,8 @@ func (s *Store) GetOrCreateRepoName(sourcePath string) (string, error) {
 	return db.GetOrCreateRepoName(s.db, sourcePath)
 }
 
-func (s *Store) RepoPathForWorkspace(wsPath string) (string, bool, error) {
-	return db.RepoPathForWorkspace(s.db, wsPath)
+func (s *Store) WorkspaceAt(wsPath string) (name, sourcePath string, found bool, err error) {
+	return db.WorkspaceAt(s.db, wsPath)
 }
 
 func (s *Store) FindAvailableWorkspace(repoName string) (*WorkspaceInfo, error) {
@@ -201,56 +201,6 @@ func (s *Store) GetWorkspaceByName(repoName, name string) (*WorkspaceInfo, error
 		return nil, fmt.Errorf("get workspace: %w", err)
 	}
 	return ws, nil
-}
-
-func (s *Store) GetWorkspaceByPath(path string) (*WorkspaceInfo, error) {
-	row := s.db.QueryRow(`SELECT repo, name, path, purpose, rev, status, acquired_by_pid,
-		provisioned, created_at, updated_at, acquired_at
-		FROM workspaces WHERE path = ?;`, paths.NormalizePath(path))
-
-	var repoName string
-	var name string
-	var wsPath string
-	var purpose string
-	var rev string
-	var status string
-	var acquiredBy sql.NullInt64
-	var provisioned int
-	var createdAt string
-	var updatedAt string
-	var acquiredAt string
-	if err := row.Scan(
-		&repoName,
-		&name,
-		&wsPath,
-		&purpose,
-		&rev,
-		&status,
-		&acquiredBy,
-		&provisioned,
-		&createdAt,
-		&updatedAt,
-		&acquiredAt,
-	); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get workspace by path: %w", err)
-	}
-
-	return hydrateWorkspaceInfo(
-		name,
-		repoName,
-		wsPath,
-		purpose,
-		rev,
-		status,
-		acquiredBy,
-		provisioned,
-		createdAt,
-		updatedAt,
-		acquiredAt,
-	)
 }
 
 func (s *Store) DeleteWorkspace(repoName, name string) error {

@@ -15,6 +15,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
+	"monks.co/pkg/jj"
 	"monks.co/ww/ww"
 )
 
@@ -97,22 +98,49 @@ func openPool() (*ww.Pool, error) {
 	return pool, nil
 }
 
-// getRepoPath returns the jj repository root for the current directory.
-func getRepoPath() (string, error) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", fmt.Errorf("get working directory: %w", err)
-	}
-	return ww.RepoRoot(cwd)
+// here is where the current directory sits relative to the pool.
+type here struct {
+	ww.Location
+	dir string
 }
 
-// resolveWorkspaceName returns the workspace name from args or current directory.
-func resolveWorkspaceName(pool *ww.Pool) (string, error) {
+// locate resolves the current directory against the pool. Every command keys
+// the pool on the source repo, which inside a pool workspace is the repo the
+// workspace came from, not the workspace jj reports as its root.
+func locate(pool *ww.Pool) (here, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
-		return "", fmt.Errorf("get working directory: %w", err)
+		return here{}, fmt.Errorf("get working directory: %w", err)
 	}
-	return pool.WorkspaceNameForPath(cwd)
+	loc, err := pool.Locate(cwd)
+	if err != nil {
+		return here{}, err
+	}
+	return here{Location: loc, dir: cwd}, nil
+}
+
+// rev pins a --rev revset to the change it names where it was typed.
+//
+// Acquire resolves a revision in the source repo, where @ is the source
+// repo's working copy. Typed inside a pool workspace, @ means that
+// workspace's working copy, as it does to jj there, so the revset is resolved
+// here first and passed on as the change it names. exactly() turns a revset
+// naming several revisions into an error rather than a merge.
+//
+// The change goes on as change_id(<id>) rather than the bare ID: Acquire
+// answers a bare change ID it cannot find by building on the source repo's @
+// instead, and a change pinned here that vanished before the acquire — say,
+// an empty working copy abandoned by a concurrent operation — should fail,
+// not quietly become the meaning of @ this exists to avoid.
+func (h here) rev(rev string) (string, error) {
+	if h.Workspace == "" {
+		return rev, nil
+	}
+	id, err := jj.New().ChangeIDAt(h.dir, "exactly("+rev+", 1)")
+	if err != nil {
+		return "", fmt.Errorf("resolve --rev %s in workspace %s: %w", rev, h.Workspace, err)
+	}
+	return "change_id(" + id + ")", nil
 }
 
 func runAcquire(cmd *cobra.Command, args []string) error {
@@ -126,13 +154,17 @@ func runAcquire(cmd *cobra.Command, args []string) error {
 	}
 	defer pool.Close()
 
-	repoPath, err := getRepoPath()
+	h, err := locate(pool)
+	if err != nil {
+		return err
+	}
+	rev, err := h.rev(acquireRev)
 	if err != nil {
 		return err
 	}
 
-	wsPath, err := pool.Acquire(repoPath, ww.AcquireOptions{
-		Rev:     acquireRev,
+	wsPath, err := pool.Acquire(h.Repo, ww.AcquireOptions{
+		Rev:     rev,
 		Purpose: acquirePurpose,
 	})
 	if err != nil {
@@ -150,22 +182,21 @@ func runRelease(cmd *cobra.Command, args []string) error {
 	}
 	defer pool.Close()
 
-	repoPath, err := getRepoPath()
+	h, err := locate(pool)
 	if err != nil {
 		return err
 	}
 
-	// If no args provided, resolve from current directory.
+	// With no names, release the workspace the current directory is in.
 	if len(args) == 0 {
-		wsName, err := resolveWorkspaceName(pool)
-		if err != nil {
-			return err
+		if h.Workspace == "" {
+			return fmt.Errorf("%s is not inside a pool workspace; name the workspaces to release", h.dir)
 		}
-		args = []string{wsName}
+		args = []string{h.Workspace}
 	}
 
 	for _, wsName := range args {
-		if err := pool.ReleaseByName(repoPath, wsName); err != nil {
+		if err := pool.ReleaseByName(h.Repo, wsName); err != nil {
 			return err
 		}
 		fmt.Printf("released workspace %s\n", wsName)
@@ -180,12 +211,12 @@ func runList(cmd *cobra.Command, args []string) error {
 	}
 	defer pool.Close()
 
-	repoPath, err := getRepoPath()
+	h, err := locate(pool)
 	if err != nil {
 		return err
 	}
 
-	items, err := pool.List(repoPath)
+	items, err := pool.List(h.Repo)
 	if err != nil {
 		return fmt.Errorf("list workspaces: %w", err)
 	}
@@ -229,7 +260,11 @@ func runExec(cmd *cobra.Command, args []string) error {
 	}
 	defer pool.Close()
 
-	repoPath, err := getRepoPath()
+	h, err := locate(pool)
+	if err != nil {
+		return err
+	}
+	rev, err := h.rev(execRev)
 	if err != nil {
 		return err
 	}
@@ -239,8 +274,8 @@ func runExec(cmd *cobra.Command, args []string) error {
 		purpose = "exec: " + args[0]
 	}
 
-	wsPath, err := pool.Acquire(repoPath, ww.AcquireOptions{
-		Rev:     execRev,
+	wsPath, err := pool.Acquire(h.Repo, ww.AcquireOptions{
+		Rev:     rev,
 		Purpose: purpose,
 	})
 	if err != nil {
@@ -329,12 +364,18 @@ func runDestroyAll(cmd *cobra.Command, args []string) error {
 	}
 	defer pool.Close()
 
-	repoPath, err := getRepoPath()
+	h, err := locate(pool)
 	if err != nil {
 		return err
 	}
+	// It would delete the workspace it runs in, along with every other
+	// session's, with no way back; asking for it from inside one is far more
+	// likely an agent's mistake than the operator's intent.
+	if h.Workspace != "" {
+		return fmt.Errorf("inside pool workspace %s, which destroy-all would delete; run it from the source repo, %s", h.Workspace, h.Repo)
+	}
 
-	return pool.DestroyAll(repoPath)
+	return pool.DestroyAll(h.Repo)
 }
 
 // exitError wraps an exit code for propagation through cobra.
