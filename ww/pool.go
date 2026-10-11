@@ -175,7 +175,6 @@ func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 		Status:        StatusAcquired,
 		AcquiredByPID: os.Getpid(),
 		AcquiredAt:    now,
-		CreatedAt:     now,
 		UpdatedAt:     now,
 	})
 	if err != nil {
@@ -495,11 +494,24 @@ type Info struct {
 	// Zero if not acquired.
 	AcquiredAt time.Time
 
-	// CreatedAt is when the workspace acquisition started.
+	// CreatedAt is when the workspace was created. Acquiring it again does
+	// not change it.
 	CreatedAt time.Time
 
-	// UpdatedAt is when the workspace was last released.
+	// UpdatedAt is when the row was last written, which for an available
+	// workspace is its release: nothing else writes a parked row.
 	UpdatedAt time.Time
+}
+
+// Since is when the workspace entered its status: the acquire for an acquired
+// workspace, the release for an available one. Zero when the pool recorded
+// neither. It is the instant a listing measures how long a workspace has been
+// held, or parked, from.
+func (i Info) Since() time.Time {
+	if i.Status == StatusAcquired {
+		return i.AcquiredAt
+	}
+	return i.UpdatedAt
 }
 
 // List returns information about all workspaces for the given repository.

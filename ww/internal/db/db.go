@@ -21,8 +21,9 @@ type OpenOptions struct {
 }
 
 // Open opens (or creates) the database at path, applies migrations, configures
-// pragmas, and clears repos rows a mistaken ww registered at a pool workspace
-// (see pruneWorkspaceRepos).
+// pragmas, clears repos rows a mistaken ww registered at a pool workspace
+// (see pruneWorkspaceRepos), and puts back creation times an acquire
+// overwrote (see restoreCreationTimes).
 func Open(path string, opts OpenOptions) (*DB, error) {
 	if path == "" {
 		return nil, fmt.Errorf("open db: path is required")
@@ -54,6 +55,11 @@ func Open(path string, opts OpenOptions) (*DB, error) {
 	}
 
 	if err := pruneWorkspaceRepos(sqlDB); err != nil {
+		_ = sqlDB.Close()
+		return nil, err
+	}
+
+	if err := restoreCreationTimes(sqlDB, birthTime); err != nil {
 		_ = sqlDB.Close()
 		return nil, err
 	}

@@ -43,10 +43,14 @@ func (s *Store) FindAvailableWorkspace(repoName string) (*WorkspaceInfo, error) 
 	return ws, nil
 }
 
+// AcquireAvailableWorkspace claims the first available workspace for an
+// acquire, stamping its purpose, revision, holder, and acquire instant. It
+// leaves created_at alone: a workspace is created once, by InsertWorkspace,
+// however many times it is acquired.
 func (s *Store) AcquireAvailableWorkspace(repoName string, ws WorkspaceInfo) (*WorkspaceInfo, error) {
 	row := s.db.QueryRow(`UPDATE workspaces
 		SET purpose = ?, rev = ?, status = ?, acquired_by_pid = ?,
-			created_at = ?, updated_at = ?, acquired_at = ?
+			updated_at = ?, acquired_at = ?
 		WHERE repo = ? AND name = (
 			SELECT name FROM workspaces WHERE repo = ? AND status = ?
 			ORDER BY name LIMIT 1
@@ -57,7 +61,6 @@ func (s *Store) AcquireAvailableWorkspace(repoName string, ws WorkspaceInfo) (*W
 		ws.Rev,
 		ws.Status,
 		sqlNullInt(ws.AcquiredByPID),
-		formatWorkspaceTime(ws.CreatedAt),
 		formatWorkspaceTime(ws.UpdatedAt),
 		formatOptionalWorkspaceTime(ws.AcquiredAt),
 		repoName,
@@ -96,29 +99,6 @@ func (s *Store) InsertWorkspace(ws WorkspaceInfo) error {
 	)
 	if err != nil {
 		return fmt.Errorf("insert workspace: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) UpdateWorkspace(ws WorkspaceInfo) error {
-	_, err := s.db.Exec(`UPDATE workspaces
-		SET path = ?, purpose = ?, rev = ?, status = ?, acquired_by_pid = ?,
-			provisioned = ?, created_at = ?, updated_at = ?, acquired_at = ?
-		WHERE repo = ? AND name = ?;`,
-		ws.Path,
-		ws.Purpose,
-		ws.Rev,
-		ws.Status,
-		sqlNullInt(ws.AcquiredByPID),
-		boolToSQLite(ws.Provisioned),
-		formatWorkspaceTime(ws.CreatedAt),
-		formatWorkspaceTime(ws.UpdatedAt),
-		formatOptionalWorkspaceTime(ws.AcquiredAt),
-		ws.Repo,
-		ws.Name,
-	)
-	if err != nil {
-		return fmt.Errorf("update workspace: %w", err)
 	}
 	return nil
 }

@@ -6,8 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 	"monks.co/ww/ww"
@@ -225,5 +227,40 @@ func TestCLI_RevResolvesWhereItWasTyped(t *testing.T) {
 	ws3 := mustWW(t, repo, "acquire", "--purpose", "from source")
 	if got := runIn(t, ws3, "jj", "log", "--no-graph", "-r", "@-", "-T", "description"); got != "source work" {
 		t.Fatalf("acquire from the source repo built on %q, want the source repo's change", got)
+	}
+}
+
+// The table answers how long each workspace has been in its status — held
+// since its acquire, parked since its release — in one FOR column. A
+// workspace's creation is not on it: a pooled workspace was created whenever
+// the pool last grew, which says nothing about the one using it now.
+func TestFormatWorkspaceTable(t *testing.T) {
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	created := now.Add(-10 * 24 * time.Hour)
+	items := []ww.Info{
+		{Name: "ws-001", Status: ww.StatusAcquired, Rev: "kmqpxlzwvnrt", Purpose: "fix", Path: "/ws/ws-001",
+			CreatedAt: created, AcquiredAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-2*time.Hour + time.Second)},
+		{Name: "ws-002", Status: ww.StatusAvailable, Path: "/ws/ws-002",
+			CreatedAt: created, UpdatedAt: now.Add(-3 * 24 * time.Hour)},
+		// Freshly created and held: its age and its time held are the same
+		// instant, which is why the table shows only one of them.
+		{Name: "ws-003", Status: ww.StatusAcquired, Rev: "tsuoyxlzwvnr", Purpose: "new", Path: "/ws/ws-003",
+			CreatedAt: now.Add(-9 * time.Second), AcquiredAt: now.Add(-9 * time.Second), UpdatedAt: now.Add(-8 * time.Second)},
+		{Name: "ws-004", Status: ww.StatusAvailable, Path: "/ws/ws-004"},
+	}
+
+	var got [][]string
+	for line := range strings.Lines(formatWorkspaceTable(items, now)) {
+		got = append(got, strings.Fields(line))
+	}
+	want := [][]string{
+		{"NAME", "STATUS", "FOR", "REV", "PURPOSE", "PATH"},
+		{"ws-001", "acquired", "2h", "kmqpxlzwvnrt", "fix", "/ws/ws-001"},
+		{"ws-002", "available", "3d", "-", "-", "/ws/ws-002"},
+		{"ws-003", "acquired", "9s", "tsuoyxlzwvnr", "new", "/ws/ws-003"},
+		{"ws-004", "available", "-", "-", "-", "/ws/ws-004"},
+	}
+	if !slices.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("table:\n%s\nwant rows %q", formatWorkspaceTable(items, now), want)
 	}
 }

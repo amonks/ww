@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"monks.co/pkg/jj"
 	"monks.co/ww/ww"
@@ -378,6 +380,65 @@ func TestPool_Acquire_ReusesAvailableWorkspace(t *testing.T) {
 	if err := pool.Release(wsPath3); err != nil {
 		t.Fatalf("failed to release workspace third time: %v", err)
 	}
+}
+
+// A workspace's creation time is when it was created, and acquiring it again
+// does not rewrite it: each acquire stamps its own instant, each release its
+// own, and Since follows whichever the workspace is in now.
+func TestPool_Acquire_KeepsCreationTime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		repoPath := setupTestRepo(t)
+		workspacesDir, _ := filepath.EvalSymlinks(t.TempDir())
+		pool := openPool(t, ww.Options{StateDir: t.TempDir(), WorkspacesDir: workspacesDir})
+
+		only := func() ww.Info {
+			t.Helper()
+			list, err := pool.List(repoPath)
+			if err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			if len(list) != 1 {
+				t.Fatalf("expected 1 workspace, got %d", len(list))
+			}
+			return list[0]
+		}
+
+		created := time.Now()
+		wsPath, err := pool.Acquire(repoPath, acquireOptions())
+		if err != nil {
+			t.Fatalf("acquire: %v", err)
+		}
+
+		time.Sleep(time.Hour)
+		released := time.Now()
+		if err := pool.Release(wsPath); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+		if got := only(); !got.CreatedAt.Equal(created) || !got.Since().Equal(released) {
+			t.Errorf("parked: created %v since %v, want created %v since %v", got.CreatedAt, got.Since(), created, released)
+		}
+
+		time.Sleep(2 * time.Hour)
+		reacquired := time.Now()
+		again, err := pool.Acquire(repoPath, acquireOptions())
+		if err != nil {
+			t.Fatalf("reacquire: %v", err)
+		}
+		if again != wsPath {
+			t.Fatalf("reacquire took %s, want the pooled %s", again, wsPath)
+		}
+		got := only()
+		if !got.CreatedAt.Equal(created) {
+			t.Errorf("reacquired created %v, want the creation %v", got.CreatedAt, created)
+		}
+		if !got.AcquiredAt.Equal(reacquired) || !got.Since().Equal(reacquired) {
+			t.Errorf("reacquired acquired %v since %v, want %v", got.AcquiredAt, got.Since(), reacquired)
+		}
+
+		if err := pool.Release(wsPath); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+	})
 }
 
 func TestPool_Acquire_ImmutableRevisionCreatesNewChange(t *testing.T) {

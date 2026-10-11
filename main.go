@@ -401,8 +401,15 @@ func (e exitError) Unwrap() error {
 
 // Table formatting helpers.
 
+// formatWorkspaceTable renders the pool as `ww list` prints it. Its one
+// duration column, FOR, is how long each workspace has been in its status —
+// held since its acquire, parked since its release — which is the question a
+// pool listing answers. A workspace's age since creation is left to --json: a
+// pooled workspace was created whenever the pool last grew, which says nothing
+// about whoever holds it now, and on a workspace still held by the acquire
+// that created it the two would be the same number.
 func formatWorkspaceTable(items []ww.Info, now time.Time) string {
-	headers := []string{"NAME", "STATUS", "AGE", "DURATION", "REV", "PURPOSE", "PATH"}
+	headers := []string{"NAME", "STATUS", "FOR", "REV", "PURPOSE", "PATH"}
 	rows := make([][]string, 0, len(items))
 	for _, item := range items {
 		purpose := item.Purpose
@@ -415,13 +422,10 @@ func formatWorkspaceTable(items []ww.Info, now time.Time) string {
 			rev = "-"
 		}
 
-		age := formatWorkspaceAge(item, now)
-		duration := formatWorkspaceDuration(item, now)
 		rows = append(rows, []string{
 			item.Name,
 			string(item.Status),
-			age,
-			duration,
+			formatWorkspaceFor(item, now),
 			rev,
 			truncateTableCell(purpose),
 			truncateTableCell(item.Path),
@@ -431,24 +435,14 @@ func formatWorkspaceTable(items []ww.Info, now time.Time) string {
 	return formatTable(headers, rows)
 }
 
-func formatWorkspaceAge(item ww.Info, now time.Time) string {
-	if item.CreatedAt.IsZero() {
+// formatWorkspaceFor is the FOR cell: the time since the workspace entered its
+// status, or "-" when the pool recorded no instant for it.
+func formatWorkspaceFor(item ww.Info, now time.Time) string {
+	since := item.Since()
+	if since.IsZero() {
 		return "-"
 	}
-	return formatDurationShort(now.Sub(item.CreatedAt))
-}
-
-func formatWorkspaceDuration(item ww.Info, now time.Time) string {
-	if item.CreatedAt.IsZero() {
-		return "-"
-	}
-	if item.Status == ww.StatusAcquired {
-		return formatDurationShort(now.Sub(item.CreatedAt))
-	}
-	if item.UpdatedAt.IsZero() {
-		return "-"
-	}
-	return formatDurationShort(item.UpdatedAt.Sub(item.CreatedAt))
+	return formatDurationShort(now.Sub(since))
 }
 
 // formatDurationShort returns a compact human-readable duration like "5m", "2h", "3d".
