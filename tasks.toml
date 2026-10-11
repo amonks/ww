@@ -14,3 +14,21 @@
   id = "generate"
   type = "short"
   dependencies = ["tidy"]
+
+# The README is pictures: VHS tapes in screenshots/, each recorded against
+# the throwaway HOME screenshots/setup.bash builds. Kept out of generate:
+# recording needs ttyd, ffmpeg, and a browser, and a GIF never renders
+# byte-identically twice, so check-for-diff could never pass over it.
+#
+# The tapes source setup.bash hidden, where its errors don't show and VHS
+# reports only a timeout, so it runs once here first, in the open.
+[[task]]
+  id = "screenshots"
+  type = "short"
+  cmd = """
+    set -euo pipefail
+    bash -c 'source screenshots/setup.bash'
+    for tape in screenshots/*.tape; do
+      go run github.com/charmbracelet/vhs@v0.12.1 "$tape"
+    done
+  """
