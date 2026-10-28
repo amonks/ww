@@ -124,6 +124,19 @@ type AcquireOptions struct {
 	// Use this when the workspace content will differ from the main tree
 	// (e.g. the todo store edits to an orphan bookmark immediately after acquire).
 	SkipHooks bool
+
+	// Step, when set, runs each phase of the acquire: Acquire hands it the
+	// phase's name and the work, and Step must call fn exactly once and
+	// return its error, or an error of its own in place of it. Whatever it
+	// returns is the phase's outcome, and the acquire handles it as it
+	// would fn's — a failure hands the workspace back, a resolve failure
+	// falls back, a stale working copy is recovered. Nil runs every phase
+	// directly.
+	//
+	// It exists so a caller can time the phases — trace them, count them —
+	// without the pool taking on a dependency of its own for it. Release
+	// has no phases; it is one step as far as a caller can see.
+	Step func(phase Phase, fn func() error) error
 }
 
 // ValidateAcquirePurpose ensures the purpose is present and single-line.
@@ -148,6 +161,8 @@ func ValidateAcquirePurpose(purpose string) error {
 //
 // If the repository contains a ww.toml or .ww/config.toml
 // configuration file, the on-create hooks run on every acquire.
+//
+// Each step of the work runs as a Phase, through opts.Step when one is set.
 func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 	// Apply defaults
 	if opts.Rev == "" {
@@ -156,38 +171,65 @@ func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 	if err := ValidateAcquirePurpose(opts.Purpose); err != nil {
 		return "", err
 	}
+	run := step(opts.Step)
 
-	repoName, err := p.store.GetOrCreateRepoName(repoPath)
-	if err != nil {
-		return "", fmt.Errorf("get repo name: %w", err)
-	}
-
+	var repoName string
 	var wsPath string
 	var wsName string
 	var needsCreate bool
 	var needsProvision bool
 
-	now := time.Now()
-	available, err := p.store.AcquireAvailableWorkspace(repoName, WorkspaceInfo{
-		Repo:          repoName,
-		Purpose:       opts.Purpose,
-		Rev:           opts.Rev,
-		Status:        StatusAcquired,
-		AcquiredByPID: os.Getpid(),
-		AcquiredAt:    now,
-		UpdatedAt:     now,
-	})
-	if err != nil {
-		return "", err
+	// What a failure hands back depends on how far the acquire got: nothing
+	// before the claim writes its row, the row alone while a new workspace
+	// has nothing on disk behind it, and the workspace itself after that.
+	// Each flag is set the moment it becomes true rather than when its phase
+	// returns, because a Step can fail a phase whose work succeeded, and the
+	// row that work claimed still has to go back.
+	var claimed, onDisk bool
+	handBack := func(err error) error {
+		switch {
+		case onDisk:
+			p.returnAfterFailedAcquire(wsPath)
+		case claimed:
+			// Nothing exists on disk to hand back, so the row goes away
+			// entirely, as it does when jj declines to add the workspace.
+			if deleteErr := p.store.DeleteWorkspace(repoName, wsName); deleteErr != nil {
+				return fmt.Errorf("%w; cleanup failed: %v", err, deleteErr)
+			}
+		}
+		return err
 	}
-	if available != nil {
-		wsPath = paths.NormalizePath(available.Path)
-		wsName = available.Name
-		needsProvision = !available.Provisioned
-	} else {
+
+	if err := run.run(PhaseClaim, func() error {
+		var err error
+		repoName, err = p.store.GetOrCreateRepoName(repoPath)
+		if err != nil {
+			return fmt.Errorf("get repo name: %w", err)
+		}
+
+		now := time.Now()
+		available, err := p.store.AcquireAvailableWorkspace(repoName, WorkspaceInfo{
+			Repo:          repoName,
+			Purpose:       opts.Purpose,
+			Rev:           opts.Rev,
+			Status:        StatusAcquired,
+			AcquiredByPID: os.Getpid(),
+			AcquiredAt:    now,
+			UpdatedAt:     now,
+		})
+		if err != nil {
+			return err
+		}
+		if available != nil {
+			wsPath = paths.NormalizePath(available.Path)
+			wsName = available.Name
+			needsProvision = !available.Provisioned
+			claimed, onDisk = true, true
+			return nil
+		}
 		wsName, err = p.store.NextWorkspaceName(repoName)
 		if err != nil {
-			return "", err
+			return err
 		}
 		wsPath = paths.NormalizePath(filepath.Join(p.workspacesDir, repoName, wsName))
 		needsCreate = true
@@ -205,27 +247,26 @@ func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 			UpdatedAt:     now,
 			Provisioned:   false,
 		}); err != nil {
-			return "", err
+			return err
 		}
+		claimed = true
+		return nil
+	}); err != nil {
+		return "", handBack(err)
 	}
 
-	// Create the workspace directory if needed
 	if needsCreate {
-		if err := os.MkdirAll(filepath.Dir(wsPath), 0755); err != nil {
-			// Nothing exists on disk to hand back, so the row goes away
-			// entirely, as it does when jj declines to add the workspace.
-			if deleteErr := p.store.DeleteWorkspace(repoName, wsName); deleteErr != nil {
-				return "", fmt.Errorf("create workspace parent dir: %w; cleanup failed: %v", err, deleteErr)
+		if err := run.run(PhaseWorkspaceAdd, func() error {
+			if err := os.MkdirAll(filepath.Dir(wsPath), 0755); err != nil {
+				return fmt.Errorf("create workspace parent dir: %w", err)
 			}
-			return "", fmt.Errorf("create workspace parent dir: %w", err)
-		}
-
-		if err := p.jj.WorkspaceAdd(repoPath, wsName, wsPath); err != nil {
-			// Clean up state on failure
-			if deleteErr := p.store.DeleteWorkspace(repoName, wsName); deleteErr != nil {
-				return "", fmt.Errorf("jj workspace add: %w; cleanup failed: %v", err, deleteErr)
+			if err := p.jj.WorkspaceAdd(repoPath, wsName, wsPath); err != nil {
+				return fmt.Errorf("jj workspace add: %w", err)
 			}
-			return "", fmt.Errorf("jj workspace add: %w", err)
+			onDisk = true
+			return nil
+		}); err != nil {
+			return "", handBack(err)
 		}
 	}
 
@@ -243,14 +284,21 @@ func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 	// is the point, since a release deletes them anyway; in the operator's
 	// own checkout it is their build output, their editor state, their
 	// .envrc.secrets. The fallback is knowingly accepted.
-	resolvedRev, err := p.jj.ChangeIDAt(repoPath, opts.Rev)
-	if err != nil {
-		resolvedRev = opts.Rev // Fall back to original if resolution fails
+	resolve := func(rev string) string {
+		var resolved string
+		if err := run.run(PhaseResolve, func() error {
+			var err error
+			resolved, err = p.jj.ChangeIDAt(repoPath, rev)
+			return err
+		}); err != nil {
+			return rev // Fall back to original if resolution fails
+		}
+		return resolved
 	}
 
 	newChange := func(parentRev string) (string, error) {
 		var rev string
-		err := p.withFreshWorkingCopy(wsPath, func() error {
+		err := p.withFreshWorkingCopy(wsPath, run, PhaseNewChange, func() error {
 			var err error
 			if strings.TrimSpace(opts.NewChangeMessage) != "" {
 				rev, err = p.jj.NewChangeWithMessage(wsPath, parentRev, opts.NewChangeMessage)
@@ -262,50 +310,45 @@ func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 		return rev, err
 	}
 
-	actualRev, err := newChange(resolvedRev)
+	actualRev, err := newChange(resolve(opts.Rev))
 	if err != nil {
 		if isMissingRevisionError(err) && looksLikeChangeID(opts.Rev) {
 			// Fall back to @ resolved in the source repo
-			fallbackRev, resolveErr := p.jj.ChangeIDAt(repoPath, "@")
-			if resolveErr != nil {
-				fallbackRev = "@"
-			}
-			actualRev, err = newChange(fallbackRev)
+			actualRev, err = newChange(resolve("@"))
 		}
 		if err != nil {
-			p.returnAfterFailedAcquire(wsPath)
-			return "", fmt.Errorf("jj new: %w", err)
+			return "", handBack(fmt.Errorf("jj new: %w", err))
 		}
 	}
 
 	if actualRev != opts.Rev {
 		if err := p.store.UpdateWorkspaceRevision(repoName, wsName, actualRev, time.Now()); err != nil {
-			p.returnAfterFailedAcquire(wsPath)
-			return "", fmt.Errorf("update workspace rev: %w", err)
+			return "", handBack(fmt.Errorf("update workspace rev: %w", err))
 		}
 	}
 
 	// Load config and run hooks (skipped for non-main-tree acquires like todo store)
 	if !opts.SkipHooks {
-		cfg, err := config.Load(repoPath)
-		if err != nil {
+		if err := run.run(PhaseOnCreate, func() error {
+			cfg, err := config.Load(repoPath)
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			// Run on-create script for every acquire
+			if err := config.RunScript(wsPath, cfg.Workspace.OnCreate); err != nil {
+				return fmt.Errorf("on-create script: %w", err)
+			}
+			return nil
+		}); err != nil {
 			// A repo-level config fault fails every acquire, so leaking
 			// here empties the pool one workspace per attempt.
-			p.returnAfterFailedAcquire(wsPath)
-			return "", fmt.Errorf("load config: %w", err)
-		}
-
-		// Run on-create script for every acquire
-		if err := config.RunScript(wsPath, cfg.Workspace.OnCreate); err != nil {
-			p.returnAfterFailedAcquire(wsPath)
-			return "", fmt.Errorf("on-create script: %w", err)
+			return "", handBack(err)
 		}
 
 		// Mark as provisioned if needed
 		if needsProvision {
 			if err := p.store.MarkWorkspaceProvisioned(repoName, wsName); err != nil {
-				p.returnAfterFailedAcquire(wsPath)
-				return "", fmt.Errorf("mark workspace provisioned: %w", err)
+				return "", handBack(fmt.Errorf("mark workspace provisioned: %w", err))
 			}
 		}
 	}
@@ -332,21 +375,33 @@ func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 // leaving nothing behind. Where the workspace really was holding unsnapshotted
 // work, that commit is the only record of it, so nameRecoveredWork describes it
 // on the way past.
-func (p *Pool) withFreshWorkingCopy(wsPath string, op func() error) error {
-	err := op()
+//
+// An acquire runs each attempt at op as phase and the recovery between them as
+// PhaseUpdateStale, all through its Step, so a caller timing it sees the
+// failed attempt, the recovery, and the retry as three phases rather than one
+// slow one. Release passes a nil run, under which phase means nothing.
+func (p *Pool) withFreshWorkingCopy(wsPath string, run step, phase Phase, op func() error) error {
+	err := run.run(phase, op)
 	if !jj.IsStaleWorkingCopy(err) {
 		return err
 	}
-	// Read before recovering, so nameRecoveredWork can tell the commit this
-	// update-stale creates from any the change already had.
-	before, beforeErr := p.jj.WorkingCopyChangeCommitIDs(wsPath)
-	if updateErr := p.jj.WorkspaceUpdateStale(wsPath); updateErr != nil {
-		return fmt.Errorf("%w (update-stale: %v)", err, updateErr)
+	if updateErr := run.run(PhaseUpdateStale, func() error {
+		// Read before recovering, so nameRecoveredWork can tell the commit
+		// this update-stale creates from any the change already had.
+		before, beforeErr := p.jj.WorkingCopyChangeCommitIDs(wsPath)
+		if err := p.jj.WorkspaceUpdateStale(wsPath); err != nil {
+			return err
+		}
+		if beforeErr == nil {
+			p.nameRecoveredWork(wsPath, before)
+		}
+		return nil
+	}); updateErr != nil {
+		// Both causes wrapped: the stale error says what went wrong, and
+		// the recovery's (or the Step's own) says why it stayed wrong.
+		return fmt.Errorf("%w (update-stale: %w)", err, updateErr)
 	}
-	if beforeErr == nil {
-		p.nameRecoveredWork(wsPath, before)
-	}
-	return op()
+	return run.run(phase, op)
 }
 
 // nameRecoveredWork describes the commit update-stale just snapshotted a stale
@@ -434,7 +489,7 @@ func (p *Pool) Release(wsPath string) error {
 // workspace stuck out of the pool, and a fault reported to whoever pressed the
 // button.
 func (p *Pool) releaseToAvailable(wsPath string) error {
-	err := p.withFreshWorkingCopy(wsPath, func() error {
+	err := p.withFreshWorkingCopy(wsPath, nil, "", func() error {
 		if err := cleanUntracked(p.jj, wsPath); err != nil {
 			return fmt.Errorf("clean untracked: %w", err)
 		}
