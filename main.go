@@ -2,7 +2,8 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -224,9 +225,8 @@ func runList(cmd *cobra.Command, args []string) error {
 	items = filterWorkspaceList(items, listAll)
 
 	if listJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(items)
+		enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "), json.Deterministic(true))
+		return json.MarshalEncode(enc, items)
 	}
 
 	if len(items) == 0 {
