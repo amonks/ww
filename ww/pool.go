@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -367,14 +366,10 @@ func (p *Pool) Acquire(repoPath string, opts AcquireOptions) (string, error) {
 // doing, and the recovery is mechanical, so the pool does it rather than
 // handing the hint out as an error.
 //
-// update-stale wipes the working copy, but it does not lose what was on it:
-// it snapshots the disk into a divergent commit sharing the workspace change's
-// id, then moves the working copy to the rewritten one. On a parked empty
-// change — the common case, since staleness lands in bulk on idle workspaces —
-// the divergent commit is empty too and the caller's `jj new` abandons it,
-// leaving nothing behind. Where the workspace really was holding unsnapshotted
-// work, that commit is the only record of it, so nameRecoveredWork describes it
-// on the way past.
+// The recovery is jj.RecoverStaleWorkingCopy, which keeps whatever the disk
+// held that jj had not seen in a commit under the workspace change's id and
+// names it after this workspace. On a parked empty change — the common case —
+// it makes no commit at all, and the caller's `jj new` moves on.
 //
 // An acquire runs each attempt at op as phase and the recovery between them as
 // PhaseUpdateStale, all through its Step, so a caller timing it sees the
@@ -386,66 +381,15 @@ func (p *Pool) withFreshWorkingCopy(wsPath string, run step, phase Phase, op fun
 		return err
 	}
 	if updateErr := run.run(PhaseUpdateStale, func() error {
-		// Read before recovering, so nameRecoveredWork can tell the commit
-		// this update-stale creates from any the change already had.
-		before, beforeErr := p.jj.WorkingCopyChangeCommitIDs(wsPath)
-		if err := p.jj.WorkspaceUpdateStale(wsPath); err != nil {
-			return err
-		}
-		if beforeErr == nil {
-			p.nameRecoveredWork(wsPath, before)
-		}
-		return nil
+		return p.jj.RecoverStaleWorkingCopy(wsPath, fmt.Sprintf(
+			"ww: work recovered from %s, which went stale before jj snapshotted it",
+			filepath.Base(wsPath)))
 	}); updateErr != nil {
 		// Both causes wrapped: the stale error says what went wrong, and
 		// the recovery's (or the Step's own) says why it stayed wrong.
 		return fmt.Errorf("%w (update-stale: %w)", err, updateErr)
 	}
 	return run.run(phase, op)
-}
-
-// nameRecoveredWork describes the commit update-stale just snapshotted a stale
-// working copy into, when there was anything on it to snapshot. before is the
-// change's commits as they stood before the recovery.
-//
-// Without this the work survives as an undescribed head under a change id that
-// now has two commits — findable only by someone who already knows to look for
-// it, and indistinguishable in `jj log` from junk worth abandoning. Naming it
-// is what turns "your edits are somewhere" into a change anyone can read.
-//
-// Only a commit the recovery actually created is named. A change can be
-// divergent for reasons of its own — two concurrent operations elsewhere
-// rewriting it — and describing one of those would be worse than saying
-// nothing: it would put this workspace's name on an unrelated commit, and
-// DescribeAt rewrites what it describes and rebases its descendants, which is
-// how a repair for one stale workspace would make another one stale.
-//
-// A commit that already carries a description is left alone too. That is a
-// session's own change, rewritten rather than recovered; overwriting what its
-// author wrote to announce the recovery would lose more than it explains.
-//
-// Best-effort throughout: this runs inside a recovery the caller did not ask
-// for, and failing to label the commit is not a reason to fail the release
-// that saved it. The empty case is the common one and does nothing at all.
-func (p *Pool) nameRecoveredWork(wsPath string, before []string) {
-	after, err := p.jj.WorkingCopyChangeCommitIDs(wsPath)
-	if err != nil {
-		return
-	}
-	for _, commit := range after {
-		if slices.Contains(before, commit) {
-			continue
-		}
-		if empty, err := p.jj.ChangeEmptyAt(wsPath, commit); err != nil || empty {
-			continue
-		}
-		if desc, err := p.jj.DescriptionAt(wsPath, commit); err != nil || strings.TrimSpace(desc) != "" {
-			continue
-		}
-		_ = p.jj.DescribeAt(wsPath, commit, fmt.Sprintf(
-			"ww: work recovered from %s, which went stale before jj snapshotted it",
-			filepath.Base(wsPath)))
-	}
 }
 
 // returnAfterFailedAcquire hands a workspace back after an acquire that
@@ -478,9 +422,9 @@ func (p *Pool) Release(wsPath string) error {
 // update-stale does not lose the work it looks like it loses: it snapshots
 // whatever the disk holds into a divergent commit under the workspace change's
 // own id before moving the working copy, so a release preserves a session's
-// last writes rather than discarding them. What it does drop — untracked,
-// ignored files — a release deletes anyway (see cleanUntracked), so a stale
-// release costs nothing a plain one does not.
+// last writes rather than discarding them. Ignored files are in no tree, so
+// the recovery leaves them where they were, and a release deletes them anyway
+// (see cleanUntracked): a stale release costs nothing a plain one does not.
 //
 // Recovery is therefore not a judgment call, and the pool does not put one to
 // anyone. It used to: release refused a stale workspace and left the operator

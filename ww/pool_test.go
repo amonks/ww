@@ -1317,7 +1317,7 @@ func TestPool_Release_RecoversStaleWorkingCopyKeepingItsWork(t *testing.T) {
 // The common case by far: staleness lands in bulk on idle workspaces, whose
 // parked change is empty. There is nothing to recover, and the recovery must
 // leave no sibling under that change's id — an empty one would be residue per
-// stale release, and nameRecoveredWork declines to describe an empty commit, so
+// stale release, and the recovery declines to describe an empty commit, so
 // only counting commits can see it.
 func TestPool_Release_StaleButEmptyLeavesNothingBehind(t *testing.T) {
 	repoPath, pool := setupPoolWithMain(t)
@@ -1378,7 +1378,7 @@ func TestPool_Release_StaleAlreadyDivergentNamesOnlyWhatItRecovered(t *testing.T
 	}
 
 	// Give the change a second, non-empty, undescribed incarnation that has
-	// nothing to do with any recovery — the shape nameRecoveredWork must not
+	// nothing to do with any recovery — the shape the recovery must not
 	// touch. Two operations racing from the same parent op diverge it.
 	if err := os.WriteFile(filepath.Join(wsPath, "unrelated.txt"), []byte("elsewhere\n"), 0644); err != nil {
 		t.Fatalf("write: %v", err)
