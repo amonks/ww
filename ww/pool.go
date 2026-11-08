@@ -453,6 +453,26 @@ func (p *Pool) releaseToAvailable(wsPath string) error {
 	return nil
 }
 
+// SetPurpose rewrites why an acquired workspace is held, from the purpose
+// the caller believes it has to another: the purpose List reports and `ww
+// list` prints. It is for a holder whose answer changes after the acquire
+// — one that acquires ahead of demand and learns later what the workspace
+// is for — so the listing stays true about what holds it. Nothing else
+// about the hold changes: the acquire's instant, and so Info.Since, stays
+// the acquire's.
+//
+// The rename is a compare-and-set on from, which is how a holder learns
+// its hold is not what it was: a workspace that is no longer acquired is
+// ErrWorkspaceNotAcquired, and one held for anything but from is
+// ErrPurposeChanged — released out from under the caller and acquired
+// again since, say. The new purpose is validated as an acquire's is.
+func (p *Pool) SetPurpose(wsPath, from, to string) error {
+	if err := ValidateAcquirePurpose(to); err != nil {
+		return err
+	}
+	return p.store.SetWorkspacePurpose(wsPath, from, to, time.Now())
+}
+
 // ReleaseByName returns a workspace to the pool by name.
 func (p *Pool) ReleaseByName(repoPath, wsName string) error {
 	repoName, err := p.store.GetOrCreateRepoName(repoPath)

@@ -141,6 +141,38 @@ func (s *Store) UpdateWorkspaceRevision(repoName, name, rev string, updatedAt ti
 	return nil
 }
 
+// SetWorkspacePurpose rewrites the purpose of the acquired workspace at
+// wsPath from one purpose to another, leaving its acquire alone. A row
+// that is not acquired, or not there, is ErrWorkspaceNotAcquired: a
+// parked row's purpose is empty by definition, and writing one would make
+// it look held. An acquired row held for anything but from is
+// ErrPurposeChanged.
+func (s *Store) SetWorkspacePurpose(wsPath, from, to string, updatedAt time.Time) error {
+	path := paths.NormalizePath(wsPath)
+	result, err := s.db.Exec(`UPDATE workspaces
+		SET purpose = ?, updated_at = ?
+		WHERE path = ? AND status = ? AND purpose = ?;`,
+		to, formatWorkspaceTime(updatedAt), path, StatusAcquired, from)
+	if err != nil {
+		return fmt.Errorf("set workspace purpose: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set workspace purpose: %w", err)
+	}
+	if rows > 0 {
+		return nil
+	}
+	var acquired int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM workspaces WHERE path = ? AND status = ?;`, path, StatusAcquired).Scan(&acquired); err != nil {
+		return fmt.Errorf("set workspace purpose: %w", err)
+	}
+	if acquired == 0 {
+		return fmt.Errorf("%w: %s", ErrWorkspaceNotAcquired, wsPath)
+	}
+	return fmt.Errorf("%w: %s is not held for %q", ErrPurposeChanged, wsPath, from)
+}
+
 func (s *Store) MarkWorkspaceProvisioned(repoName, name string) error {
 	_, err := s.db.Exec(`UPDATE workspaces
 		SET provisioned = 1

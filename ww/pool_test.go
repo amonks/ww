@@ -1482,3 +1482,75 @@ func TestPool_Acquire_ReturnsWorkspaceWhenConfigFails(t *testing.T) {
 		t.Fatalf("failed acquire leaked workspace %s in status %s", list[0].Name, list[0].Status)
 	}
 }
+
+// A holder can say what it is holding a workspace for once it knows: the
+// purpose is rewritten in place, the acquire's own instant untouched, so a
+// listing measures the hold from the acquire still. cc prepares a
+// workspace before it knows which session will have it, and renames the
+// hold when one does. The rename is a compare-and-set on the purpose the
+// caller believes the hold has, so a holder whose workspace was released
+// out from under it — and perhaps acquired by someone else since — is told
+// so rather than renaming another's hold.
+func TestPool_SetPurpose(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	workspacesDir := t.TempDir()
+	workspacesDir, _ = filepath.EvalSymlinks(workspacesDir)
+	pool := openPool(t, ww.Options{StateDir: t.TempDir(), WorkspacesDir: workspacesDir})
+
+	wsPath, err := pool.Acquire(repoPath, ww.AcquireOptions{Purpose: "preparing"})
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	list, err := pool.List(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquiredAt := list[0].AcquiredAt
+
+	if err := pool.SetPurpose(wsPath, "preparing", "ready"); err != nil {
+		t.Fatalf("set purpose: %v", err)
+	}
+	list, err = pool.List(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := list[0]; got.Purpose != "ready" || got.Status != ww.StatusAcquired || !got.AcquiredAt.Equal(acquiredAt) || !got.Since().Equal(acquiredAt) {
+		t.Errorf("after set purpose: purpose %q status %s acquired %v since %v, want ready, acquired, since %v",
+			got.Purpose, got.Status, got.AcquiredAt, got.Since(), acquiredAt)
+	}
+
+	// The hold is no longer what the caller thinks it is.
+	if err := pool.SetPurpose(wsPath, "preparing", "mine"); !errors.Is(err, ww.ErrPurposeChanged) {
+		t.Errorf("set purpose from a stale purpose = %v, want ErrPurposeChanged", err)
+	}
+
+	// The purpose is validated as an acquire's is.
+	for _, bad := range []string{"", "  ", "two\nlines"} {
+		if err := pool.SetPurpose(wsPath, "ready", bad); err == nil {
+			t.Errorf("set purpose %q succeeded, want refused", bad)
+		}
+	}
+	if list, err := pool.List(repoPath); err != nil {
+		t.Fatal(err)
+	} else if list[0].Purpose != "ready" {
+		t.Errorf("a refused purpose changed the row to %q", list[0].Purpose)
+	}
+
+	// Only a held workspace has a purpose to change: a parked one says
+	// nothing about why it is held, and a path the pool never made is
+	// nobody's.
+	if err := pool.Release(wsPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.SetPurpose(wsPath, "ready", "too late"); !errors.Is(err, ww.ErrWorkspaceNotAcquired) {
+		t.Errorf("set purpose on a released workspace = %v, want ErrWorkspaceNotAcquired", err)
+	}
+	if list, err := pool.List(repoPath); err != nil {
+		t.Fatal(err)
+	} else if list[0].Purpose != "" || list[0].Status != ww.StatusAvailable {
+		t.Errorf("released workspace now has purpose %q status %s", list[0].Purpose, list[0].Status)
+	}
+	if err := pool.SetPurpose(filepath.Join(workspacesDir, "nowhere"), "ready", "anything"); !errors.Is(err, ww.ErrWorkspaceNotAcquired) {
+		t.Errorf("set purpose on an unknown path = %v, want ErrWorkspaceNotAcquired", err)
+	}
+}
