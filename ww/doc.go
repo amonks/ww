@@ -52,7 +52,11 @@
 // configure workspace behavior:
 //
 //	[workspace]
-//	on-create = ["npm install"]  # Run every time workspace is acquired
+//	on-create = "npm install"   # run in the workspace on every acquire
+//	on-release = "rm -rf dist"  # run in the workspace on every release, before it is cleaned
+//
+// A failing on-create fails the acquire; a failing on-release fails the
+// release, and the workspace stays held.
 //
 // # Storage
 //

@@ -432,7 +432,14 @@ func (p *Pool) Release(wsPath string) error {
 // edits. It does not, and the refusal bought nothing — while costing a
 // workspace stuck out of the pool, and a fault reported to whoever pressed the
 // button.
+//
+// Before any of that, the repo's on-release script runs in the workspace (see
+// runOnRelease). A failure there fails the release and leaves the workspace
+// held, as a failing on-create fails an acquire.
 func (p *Pool) releaseToAvailable(wsPath string) error {
+	if err := p.runOnRelease(wsPath); err != nil {
+		return err
+	}
 	err := p.withFreshWorkingCopy(wsPath, nil, "", func() error {
 		if err := cleanUntracked(p.jj, wsPath); err != nil {
 			return fmt.Errorf("clean untracked: %w", err)
@@ -449,6 +456,31 @@ func (p *Pool) releaseToAvailable(wsPath string) error {
 	wsPath = paths.NormalizePath(wsPath)
 	if err := p.store.ReleaseWorkspace(wsPath, time.Now()); err != nil {
 		return fmt.Errorf("release workspace: %w", err)
+	}
+	return nil
+}
+
+// runOnRelease runs the source repo's on-release script in the workspace,
+// on every release, before the release cleans it: the script sees the
+// workspace as its holder left it, untracked files and all, so it can clear
+// what the session made outside the workspace that only the workspace's own
+// state can find (this repo's removes the session's build output from the
+// scratch volume, at paths named for the workspace). The configuration is
+// the source repo's, as on-create's is, since a workspace is never a repo.
+func (p *Pool) runOnRelease(wsPath string) error {
+	_, repoPath, found, err := p.store.WorkspaceAt(wsPath)
+	if err != nil {
+		return fmt.Errorf("find workspace's repo: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("workspace not found: %s", wsPath)
+	}
+	cfg, err := config.Load(repoPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	if err := config.RunScript(wsPath, cfg.Workspace.OnRelease); err != nil {
+		return fmt.Errorf("on-release script: %w", err)
 	}
 	return nil
 }

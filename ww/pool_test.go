@@ -1212,6 +1212,112 @@ func TestPool_Acquire_SkipHooksSkipsOnCreate(t *testing.T) {
 	}
 }
 
+// writeOnReleaseHook writes a project ww.toml at repoPath whose on-release
+// script is the given shell body.
+func writeOnReleaseHook(t *testing.T, repoPath, body string) {
+	t.Helper()
+	cfg := "[workspace]\non-release = '''\n" + body + "\n'''\n"
+	if err := os.WriteFile(filepath.Join(repoPath, "ww.toml"), []byte(cfg), 0644); err != nil {
+		t.Fatalf("write ww.toml: %v", err)
+	}
+}
+
+// The on-release hook runs in the workspace on every release, before ww
+// cleans it: it sees what the session left there, untracked files included,
+// which is how the repo's own hook finds the build output a session made
+// outside the workspace.
+func TestPool_Release_RunsOnReleaseHookBeforeCleaning(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	workspacesDir := t.TempDir()
+	workspacesDir, _ = filepath.EvalSymlinks(workspacesDir)
+
+	// The marker lives outside the workspace: release deletes untracked files.
+	marker := filepath.Join(t.TempDir(), "runs")
+	t.Setenv("WW_TEST_MARKER", marker)
+	writeOnReleaseHook(t, repoPath, `printf '%s %s\n' "$PWD" "$(cat left-behind 2>/dev/null || echo cleaned)" >> "$WW_TEST_MARKER"`)
+
+	pool := openPool(t, ww.Options{
+		StateDir:      t.TempDir(),
+		WorkspacesDir: workspacesDir,
+	})
+
+	for range 2 {
+		wsPath, err := pool.Acquire(repoPath, acquireOptions())
+		if err != nil {
+			t.Fatalf("acquire: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(wsPath, "left-behind"), []byte("present"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.Release(wsPath); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(wsPath, "left-behind")); !os.IsNotExist(err) {
+			t.Fatalf("release left the untracked file behind: %v", err)
+		}
+	}
+
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected on-release to run once per release (2 runs), got %d: %q", len(lines), lines)
+	}
+	list, err := pool.List(repoPath)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: %v, %v", list, err)
+	}
+	for i, line := range lines {
+		dir, seen, _ := strings.Cut(line, " ")
+		if normalizePath(dir) != normalizePath(list[0].Path) {
+			t.Errorf("run %d: expected hook cwd %q, got %q", i+1, list[0].Path, dir)
+		}
+		if seen != "present" {
+			t.Errorf("run %d: the hook saw the workspace already cleaned", i+1)
+		}
+	}
+}
+
+// A failing on-release hook fails the release, as a failing on-create fails
+// an acquire, and the workspace stays held rather than going back to the pool
+// with whatever the hook was to clear still in place.
+func TestPool_Release_OnReleaseHookFailureIsFatal(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	workspacesDir := t.TempDir()
+	workspacesDir, _ = filepath.EvalSymlinks(workspacesDir)
+
+	pool := openPool(t, ww.Options{
+		StateDir:      t.TempDir(),
+		WorkspacesDir: workspacesDir,
+	})
+	wsPath, err := pool.Acquire(repoPath, acquireOptions())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	writeOnReleaseHook(t, repoPath, "exit 1")
+	if err := pool.Release(wsPath); err == nil {
+		t.Fatal("expected release to fail when the on-release hook exits non-zero")
+	} else if !strings.Contains(err.Error(), "on-release script") {
+		t.Fatalf("expected an on-release script error, got %v", err)
+	}
+	list, err := pool.List(repoPath)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: %v, %v", list, err)
+	}
+	if list[0].Status != ww.StatusAcquired {
+		t.Fatalf("expected the workspace to stay acquired, got status %s", list[0].Status)
+	}
+
+	// Once the hook succeeds, the release goes through.
+	writeOnReleaseHook(t, repoPath, "true")
+	if err := pool.Release(wsPath); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+}
+
 // A workspace idling in the pool holds a parked change that the source repo
 // can rewrite out from under it — a rebase, a revert inserted before it, an
 // undo of either. jj then refuses to touch that workspace until someone runs

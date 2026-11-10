@@ -17,6 +17,7 @@ type Config struct {
 type Workspace struct {
 	OnCreate  string `toml:"on-create"`
 	OnAcquire string `toml:"on-acquire"`
+	OnRelease string `toml:"on-release"`
 }
 
 func Load(repoPath string) (*Config, error) {
@@ -105,6 +106,7 @@ func mergeConfigs(globalCfg, projectCfg *Config, globalMeta, projectMeta toml.Me
 	merged := Config{}
 	merged.Workspace.OnCreate = mergeString(projectMeta.IsDefined("workspace", "on-create"), projectCfg.Workspace.OnCreate, globalCfg.Workspace.OnCreate)
 	merged.Workspace.OnAcquire = mergeString(projectMeta.IsDefined("workspace", "on-acquire"), projectCfg.Workspace.OnAcquire, globalCfg.Workspace.OnAcquire)
+	merged.Workspace.OnRelease = mergeString(projectMeta.IsDefined("workspace", "on-release"), projectCfg.Workspace.OnRelease, globalCfg.Workspace.OnRelease)
 	return &merged
 }
 
